@@ -11,13 +11,12 @@ metadata:
   labels:
 {{ include "reloader-labels.chart" . | indent 4 }}
 {{- if .Values.reloader.rbac.labels }}
-{{ toYaml .Values.reloader.rbac.labels | indent 4 }}
+{{ tpl (toYaml .Values.reloader.rbac.labels) . | indent 4 }}
 {{- end }}
 {{- if .Values.reloader.matchLabels }}
-{{ toYaml .Values.reloader.matchLabels | indent 4 }}
+{{ tpl (toYaml .Values.reloader.matchLabels) . | indent 4 }}
 {{- end }}
   name: {{ template "reloader-fullname" . }}-role
-  namespace: {{ .Release.Namespace }}
 rules:
   - apiGroups:
       - ""
@@ -32,12 +31,34 @@ rules:
       - list
       - get
       - watch
-{{- if or (.Capabilities.APIVersions.Has "apps.openshift.io/v1") (.Values.isOpenshift) }}
+{{- if (include "reloader-namespaceSelector" .) }}
+  - apiGroups:
+      - ""
+    resources:
+      - namespaces
+    verbs:
+      - get
+      - list
+      - watch
+{{- end }}
+{{- if and (.Capabilities.APIVersions.Has "apps.openshift.io/v1") (.Values.reloader.isOpenshift) }}
   - apiGroups:
       - "apps.openshift.io"
       - ""
     resources:
       - deploymentconfigs
+    verbs:
+      - list
+      - get
+      - update
+      - patch
+{{- end }}
+{{- if and (.Capabilities.APIVersions.Has "argoproj.io/v1alpha1") (.Values.reloader.isArgoRollouts) }}
+  - apiGroups:
+      - "argoproj.io"
+      - ""
+    resources:
+      - rollouts
     verbs:
       - list
       - get
@@ -55,14 +76,42 @@ rules:
       - get
       - update
       - patch
+{{- if .Values.reloader.ignoreCronJobs }}{{- else }}
   - apiGroups:
-      - "extensions"
+      - "batch"
     resources:
-      - deployments
-      - daemonsets
+      - cronjobs
     verbs:
       - list
       - get
-      - update
+{{- end }}
+{{- if .Values.reloader.ignoreJobs }}{{- else }}
+  - apiGroups:
+      - "batch"
+    resources:
+      - jobs
+    verbs:
+      - create
+      - delete
+      - list
+      - get
+{{- end}}
+{{- if .Values.reloader.enableCSIIntegration }}
+  - apiGroups:
+      - "secrets-store.csi.x-k8s.io"
+    resources:
+      - secretproviderclasspodstatuses
+      - secretproviderclasses
+    verbs:
+      - list
+      - get
+      - watch
+{{- end}}
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
       - patch
 {{- end }}

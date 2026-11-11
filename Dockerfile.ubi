@@ -1,0 +1,53 @@
+ARG BUILDER_IMAGE
+ARG BASE_IMAGE
+
+FROM --platform=${BUILDPLATFORM} ${BUILDER_IMAGE} AS SRC
+
+FROM ${BASE_IMAGE:-registry.access.redhat.com/ubi9/ubi:9.8-1782841664} AS ubi
+ARG TARGETARCH
+
+
+RUN dnf update -y && dnf install -y binutils
+# prep target rootfs for scratch container
+WORKDIR /
+RUN mkdir /image && \
+    ln -s usr/bin /image/bin && \
+	ln -s usr/sbin /image/sbin && \
+	ln -s usr/lib64 /image/lib64 && \
+	ln -s usr/lib /image/lib && \
+	mkdir -p /image/{usr/bin,usr/lib64,usr/lib,root,home,proc,etc,sys,var,dev}
+
+COPY ubi-build-files-${TARGETARCH}.txt /tmp
+# Copy all the required files from the base UBI image into the image directory
+# As the go binary is not statically compiled this includes everything needed for CGO to work, cacerts, tzdata and RH release files
+# Filter existing files and exclude temporary entitlement files that may be removed during build
+RUN while IFS= read -r file; do \
+      [ -z "$file" ] && continue; \
+      if [ -e "$file" ] || [ -L "$file" ]; then \
+        echo "$file"; \
+      fi; \
+    done < /tmp/ubi-build-files-${TARGETARCH}.txt > /tmp/existing-files.txt && \
+    if [ -s /tmp/existing-files.txt ]; then \
+      tar -chf /tmp/files.tar --exclude='etc/pki/entitlement-host*' -T /tmp/existing-files.txt 2>&1 | grep -vE "(File removed before we read it|Cannot stat)" || true; \
+      if [ -f /tmp/files.tar ]; then \
+        tar xf /tmp/files.tar -C /image/ 2>/dev/null || true; \
+        rm -f /tmp/files.tar; \
+      fi; \
+    fi && \
+    rm -f /tmp/existing-files.txt
+
+# Generate a rpm database which contains all the packages that you said were needed in ubi-build-files-*.txt
+RUN rpm --root /image --initdb \
+  && PACKAGES=$(rpm -qf $(cat /tmp/ubi-build-files-${TARGETARCH}.txt) | grep -v "is not owned by any package" | sort -u) \
+  && echo dnf install -y 'dnf-command(download)' \
+  && dnf download --destdir / ${PACKAGES} \
+  && rpm --root /image -ivh --justdb --nodeps `for i in ${PACKAGES}; do echo $i.rpm; done`
+
+FROM scratch
+COPY --from=ubi /image/ /
+COPY --from=SRC /manager .
+USER 65532:65532
+# Port for metrics and probes
+EXPOSE 9090
+
+ENTRYPOINT ["/manager"]

@@ -1,243 +1,510 @@
-# ![](assets/web/reloader-round-100px.png) RELOADER
+<p align="center">
+  <img src="assets/web/reloader.jpg" alt="Reloader" width="40%"/>
+</p>
 
+[![💖 Sponsor Our Work](https://img.shields.io/badge/Sponsor%20Our%20Work-FF8C00?style=flat-square&logo=github-sponsors&logoColor=white)](https://github.com/sponsors/stakater?utm_source=github&utm_medium=readme&utm_campaign=reloader)
 [![Go Report Card](https://goreportcard.com/badge/github.com/stakater/reloader?style=flat-square)](https://goreportcard.com/report/github.com/stakater/reloader)
-[![Go Doc](https://img.shields.io/badge/godoc-reference-blue.svg?style=flat-square)](http://godoc.org/github.com/stakater/reloader)
+[![Go Doc](https://img.shields.io/badge/godoc-reference-blue.svg?style=flat-square)](https://godoc.org/github.com/stakater/reloader)
 [![Release](https://img.shields.io/github/release/stakater/reloader.svg?style=flat-square)](https://github.com/stakater/reloader/releases/latest)
 [![GitHub tag](https://img.shields.io/github/tag/stakater/reloader.svg?style=flat-square)](https://github.com/stakater/reloader/releases/latest)
 [![Docker Pulls](https://img.shields.io/docker/pulls/stakater/reloader.svg?style=flat-square)](https://hub.docker.com/r/stakater/reloader/)
-[![Docker Stars](https://img.shields.io/docker/stars/stakater/reloader.svg?style=flat-square)](https://hub.docker.com/r/stakater/reloader/)
-[![MicroBadger Size](https://img.shields.io/microbadger/image-size/stakater/reloader.svg?style=flat-square)](https://microbadger.com/images/stakater/reloader)
-[![MicroBadger Layers](https://img.shields.io/microbadger/layers/stakater/reloader.svg?style=flat-square)](https://microbadger.com/images/stakater/reloader)
+[![GitHub Stars](https://img.shields.io/github/stars/stakater/Reloader.svg?style=flat-square)](https://github.com/stakater/Reloader)
 [![license](https://img.shields.io/github/license/stakater/reloader.svg?style=flat-square)](LICENSE)
-[![Get started with Stakater](https://stakater.github.io/README/stakater-github-banner.png)](http://stakater.com/?utm_source=Reloader&utm_medium=github)
 
-## Problem
+## 📢 Reloader v2 is here
 
-We would like to watch if some change happens in `ConfigMap` and/or `Secret`; then perform a rolling upgrade on relevant `DeploymentConfig`, `Deployment`, `Daemonset` and `Statefulset`
+Reloader v2, rebuilt on the [Operator SDK](https://sdk.operatorframework.io/), has been released. All new development happens on the [`v2`](https://github.com/stakater/Reloader/tree/v2) branch.
 
-## Solution
+The `master` branch (Reloader v1) is **feature-frozen** and will only receive security and critical bug fixes. Please open new feature requests and pull requests against `v2`, and see the [contribution guide](#contributing) for branch and PR title rules.
 
-Reloader can watch changes in `ConfigMap` and `Secret` and do rolling upgrades on Pods with their associated `DeploymentConfigs`, `Deployments`, `Daemonsets` and `Statefulsets`.
+## 🔁 What is Reloader?
 
-## Compatibility
+Reloader is a Kubernetes controller that automatically triggers rollouts of workloads (like Deployments, StatefulSets, and more) whenever referenced `Secrets`, `ConfigMaps` or **optionally CSI-mounted secrets** are updated.
 
-Reloader is compatible with kubernetes >= 1.9
+In a traditional Kubernetes setup, updating a `Secret` or `ConfigMap` does not automatically restart or redeploy your workloads. This can lead to stale configurations running in production, especially when dealing with dynamic values like credentials, feature flags, or environment configs.
 
-## How to use Reloader
+Reloader bridges that gap by ensuring your workloads stay in sync with configuration changes — automatically and safely.
 
-For a `Deployment` called `foo` have a `ConfigMap` called `foo-configmap` or `Secret` called `foo-secret` or both. Then add your annotation (by default `reloader.stakater.com/auto`) to main metadata of your `Deployment`
+📚 Full documentation is available at [Stakater documentation site](https://docs.stakater.com/reloader/)
+
+## 🚀 Why Reloader?
+
+- ✅ **Zero manual restarts**: No need to manually rollout workloads after config/secret changes.
+- 🔒 **Secure by design**: Ensure your apps always use the most up-to-date credentials or tokens.
+- 🛠️ **Flexible**: Works with all major workload types — Deployment, StatefulSet, Daemonset, ArgoRollout, and more.
+- ⚡ **Fast feedback loop**: Ideal for CI/CD pipelines where secrets/configs change frequently.
+- 🔄 **Out-of-the-box integration**: Just label your workloads and let Reloader do the rest.
+
+## 🔧 How It Works?
+
+```mermaid
+flowchart LR
+  ExternalSecret -->|Creates| Secret
+  SealedSecret -->|Creates| Secret
+  Certificate -->|Creates| Secret
+  Secret -->|Watched by| Reloader
+  ConfigMap -->|Watched by| Reloader
+
+  Reloader -->|Triggers Rollout| Deployment
+  Reloader -->|Triggers Rollout| DeploymentConfig
+  Reloader -->|Triggers Rollout| Daemonset
+  Reloader -->|Triggers Rollout| Statefulset
+  Reloader -->|Triggers Rollout| ArgoRollout
+  Reloader -->|Triggers Job| CronJob
+  Reloader -->|Sends Notification| Slack,Teams,Webhook
+```
+
+- Sources like `ExternalSecret`, `SealedSecret`, or `Certificate` from `cert-manager` can create or manage Kubernetes `Secrets` — but they can also be created manually or delivered through GitOps workflows.
+- `Secrets` and `ConfigMaps` are watched by Reloader.
+- When changes are detected, Reloader automatically triggers a rollout of the associated workloads, ensuring your app always runs with the latest configuration.
+
+## 🏢 Reloader Enterprise
+
+Reloader OSS is free and production-proven with 24B+ downloads.
+
+For teams with stricter requirements:
+
+| Need | Enterprise |
+|------|-----------|
+| CVE-free, signed images with SBOM | ✅ |
+| SLA-backed support from Kubernetes experts | ✅ |
+| Artifact provenance for compliance audits | ✅ |
+| Dedicated escalation path | ✅ |
+
+→ [Contact Sales](mailto:sales@stakater.com) for info about Reloader Enterprise.
+
+## ⚡ Quick Start
+
+### 1. Install Reloader
+
+Follow any of this [installation options](#-installation).
+
+### 2. Annotate Your Workload
+
+To enable automatic reload for a Deployment:
 
 ```yaml
+apiVersion: apps/v1
 kind: Deployment
 metadata:
+  name: my-app
   annotations:
     reloader.stakater.com/auto: "true"
 spec:
-  template: metadata:
-```
-
-This will discover deployments/daemonsets/statefulset automatically where `foo-configmap` or `foo-secret` is being used either via environment variable or from volume mount. And it will perform rolling upgrade on related pods when `foo-configmap` or `foo-secret`are updated.
-
-You can restrict this discovery to only `ConfigMap` or `Secret` objects that
-are tagged with a special annotation. To take advantage of that, annotate
-your deployment/daemonset/statefulset like this:
-
-```yaml
-kind: Deployment
-metadata:
-  annotations:
-    reloader.stakater.com/search: "true"
-spec:
   template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+        - name: app
+          image: your-image
+          envFrom:
+            - configMapRef:
+                name: my-config
+            - secretRef:
+                name: my-secret
 ```
 
-and Reloader will trigger the rolling upgrade upon modification of any
-`ConfigMap` or `Secret` annotated like this:
+This tells Reloader to watch the `ConfigMap` and `Secret` referenced in this deployment. When either is updated, it will trigger a rollout.
+
+## 🧩 Usage
+
+Reloader supports multiple annotation-based controls to let you **customize when and how your Kubernetes workloads are reloaded** upon changes in `Secrets` or `ConfigMaps`.
+
+Kubernetes does not trigger pod restarts when a referenced `Secret` or `ConfigMap` is updated. Reloader bridges this gap by watching for changes and automatically performing rollouts — but it gives you full control via annotations, so you can:
+
+- Reload **all** resources by default
+- Restrict reloads to only **Secrets** or only **ConfigMaps**
+- Watch only **specific resources**
+- Use **opt-in via tagging** (`search` + `match`)
+- Exclude workloads you don’t want to reload
+
+### 1. 🔁 Automatic Reload (Default)
+
+Use these annotations to automatically restart the workload when referenced `Secrets` or `ConfigMaps` change.
+
+| Annotation                                 | Description                                                          |
+|--------------------------------------------|----------------------------------------------------------------------|
+| `reloader.stakater.com/auto: "true"`       | Reloads workload when any referenced ConfigMap or Secret changes     |
+| `secret.reloader.stakater.com/auto: "true"`| Reloads only when referenced Secret(s) change                        |
+| `configmap.reloader.stakater.com/auto: "true"`| Reloads only when referenced ConfigMap(s) change                  |
+
+### 2. 📛 Named Resource Reload (Specific Resource Annotations)
+
+These annotations allow you to manually define which ConfigMaps or Secrets should trigger a reload, regardless of whether they're used in the pod spec.
+
+| Annotation                                          | Description                                                                          |
+|-----------------------------------------------------|--------------------------------------------------------------------------------------|
+| `secret.reloader.stakater.com/reload: "my-secret"`  | Reloads when specific Secret(s) change, regardless of how they're used              |
+| `configmap.reloader.stakater.com/reload: "my-config"`| Reloads when specific ConfigMap(s) change, regardless of how they're used         |
+
+#### Use when
+
+1. ✅ This is useful in tightly scoped scenarios where config is shared but reloads are only relevant in certain cases.
+1. ✅ Use this when you know exactly which resource(s) matter and want to avoid auto-discovery or searching altogether.
+
+### 3. 🎯 Targeted Reload (Match + Search Annotations)
+
+This pattern allows fine-grained reload control — workloads only restart if the Secret/ConfigMap is both:
+
+1. Referenced by the workload
+1. Explicitly annotated with `match: true`
+
+| Annotation                                | Applies To   | Description                                                                 |
+|-------------------------------------------|--------------|-----------------------------------------------------------------------------|
+| `reloader.stakater.com/search: "true"`    | Workload     | Enables search mode (only reloads if matching secrets/configMaps are found) |
+| `reloader.stakater.com/match: "true"`     | ConfigMap/Secret | Marks the config/secret as eligible for reload in search mode              |
+
+#### How it works
+
+1. The workload must have: `reloader.stakater.com/search: "true"`
+1. The ConfigMap or Secret must have: `reloader.stakater.com/match: "true"`
+1. The resource (ConfigMap or Secret) must also be referenced in the workload (via env, `volumeMount`, etc.)
+
+#### Use when
+
+1. ✅ You want to reload a workload only if it references a ConfigMap or Secret that has been explicitly tagged with `reloader.stakater.com/match: "true"`.
+1. ✅ Use this when you want full control over which shared or system-wide resources trigger reloads. Great in multi-tenant clusters or shared configs.
+
+### ⛔ Resource-Level Ignore Annotation
+
+When you need to prevent specific ConfigMaps or Secrets from triggering any reloads, use the ignore annotation on the resource itself:
 
 ```yaml
-kind: ConfigMap
+apiVersion: v1
+kind: ConfigMap  # or Secret
 metadata:
+  name: my-config
   annotations:
-    reloader.stakater.com/match: "true"
-data:
-  key: value
+    reloader.stakater.com/ignore: "true"
 ```
 
-provided the secret/configmap is being used in an environment variable or a
-volume mount.
+This instructs Reloader to skip all reload logic for that resource across all workloads.
 
-Please note that `reloader.stakater.com/search` and
-`reloader.stakater.com/auto` do not work together. If you have the
-`reloader.stakater.com/auto: "true"` annotation on your deployment, then it
-will always restart upon a change in configmaps or secrets it uses, regardless
-of whether they have the `reloader.stakater.com/match: "true"` annotation or
-not.
+### 4. ⚙️ Workload-Specific Rollout Strategy (Argo Rollouts Only)
 
-We can also specify a specific configmap or secret which would trigger rolling upgrade only upon change in our specified configmap or secret, this way, it will not trigger rolling upgrade upon changes in all configmaps or secrets used in a deployment, daemonset or statefulset.
-To do this either set the auto annotation to `"false"` (`reloader.stakater.com/auto: "false"`) or remove it altogether, and use annotations mentioned [here](#Configmap) or [here](#Secret)
+Note: This is only applicable when using [Argo Rollouts](https://argoproj.github.io/argo-rollouts/). It is ignored for standard Kubernetes `Deployments`, `StatefulSets`, or `DaemonSets`. To use this feature, Argo Rollouts support must be enabled in Reloader (for example via --is-argo-rollouts=true).
 
-### Configmap
+By default, Reloader triggers the Argo Rollout controller to perform a standard rollout by updating the pod template. This works well in most cases, however, because this modifies the workload spec, GitOps tools like ArgoCD will detect this as "Configuration Drift" and mark your application as OutOfSync.
 
-To perform rolling upgrade when change happens only on specific configmaps use below annotation.
-
-For a `Deployment` called `foo` have a `ConfigMap` called `foo-configmap`. Then add this annotation to main metadata of your `Deployment`
+To avoid that, you can switch to the **restart** strategy, which simply restarts the pod without changing the pod template.
 
 ```yaml
-kind: Deployment
 metadata:
   annotations:
-    configmap.reloader.stakater.com/reload: "foo-configmap"
+    reloader.stakater.com/rollout-strategy: "restart"
+```
+
+| Value              | Behavior                                                        |
+|--------------------|-----------------------------------------------------------------|
+| `rollout` (default) | Updates pod template metadata to trigger a rollout             |
+| `restart`           | Deletes the pod to restart it without patching the template    |
+
+✅ Use `restart` if:
+
+1. You're using GitOps and want to avoid drift
+1. You want a quick restart without changing the workload spec
+1. Your platform restricts metadata changes
+
+This setting affects Argo Rollouts behavior, not Argo CD sync settings.
+
+### 5. ❗ Annotation Behavior Rules & Compatibility
+
+- `reloader.stakater.com/auto` and `reloader.stakater.com/search` **cannot be used together** — the `auto` annotation takes precedence.
+- If both `auto` and its typed versions (`secret.reloader.stakater.com/auto`, `configmap.reloader.stakater.com/auto`) are used, **only one needs to be true** to trigger a reload.
+- Setting `reloader.stakater.com/auto: "false"` explicitly disables reload for that workload.
+- If `--auto-reload-all` is enabled on the controller:
+    - All workloads are treated as if they have `auto: "true"` unless they explicitly set it to `"false"`.
+    - Missing or unrecognized annotation values are treated as `"false"`.
+
+### 6. 🔔 Alerting on Reload
+
+Reloader can optionally **send alerts** whenever it triggers a rolling upgrade for a workload (e.g., `Deployment`, `StatefulSet`, etc.).
+
+These alerts are sent to a configured **webhook endpoint**, which can be a generic receiver or services like Slack, Microsoft Teams or Google Chat.
+
+To enable this feature, update the `reloader.env.secret` section in your `values.yaml` (when installing via Helm):
+
+```yaml
+reloader:
+  deployment:
+    env:
+      secret:
+        ALERT_ON_RELOAD: "true"                    # Enable alerting (default: false)
+        ALERT_SINK: "slack"                        # Options: slack, teams, gchat or webhook (default: webhook)
+        ALERT_WEBHOOK_URL: "<your-webhook-url>"    # Required if ALERT_ON_RELOAD is true
+        ALERT_ADDITIONAL_INFO: "Triggered by Reloader in staging environment"
+```
+
+### 7. ⏸️ Pause Deployments
+
+This feature allows you to pause rollouts for a deployment for a specified duration, helping to prevent multiple restarts when several ConfigMaps or Secrets are updated in quick succession.
+
+| Annotation                                              | Applies To   | Description                                                                 |
+|---------------------------------------------------------|--------------|-----------------------------------------------------------------------------|
+| `deployment.reloader.stakater.com/pause-period: "5m"`   | Deployment   | Pauses reloads for the specified period (e.g., `5m`, `1h`)                  |
+
+#### How it works
+
+1. Add the `deployment.reloader.stakater.com/pause-period` annotation to your Deployment, specifying the pause duration (e.g., `"5m"` for five minutes).
+1. When a watched ConfigMap or Secret changes, Reloader will still trigger a reload event, but if the deployment is paused, the rollout will have no effect until the pause period has elapsed.
+1. This avoids repeated restarts if multiple resources are updated close together.
+
+#### Use when
+
+1. ✅ Your deployment references multiple ConfigMaps or Secrets that may be updated at the same time.
+1. ✅ You want to minimize unnecessary rollouts and reduce downtime caused by back-to-back configuration changes.
+
+### 8. 🔐 CSI Secret Provider Support
+
+Reloader supports the [Secrets Store CSI Driver](https://secrets-store-csi-driver.sigs.k8s.io/), which allows mounting secrets from external secret stores (like AWS Secrets Manager, Azure Key Vault, HashiCorp Vault) directly into pods.
+Unlike Kubernetes Secret objects, CSI-mounted secrets do not always trigger native Kubernetes update events. Reloader solves this by watching CSI status resources and restarting affected workloads when mounted secret versions change.
+
+#### How it works
+
+When secret rotation is enabled, the Secrets Store CSI Driver updates a Kubernetes resource called: `SecretProviderClassPodStatus`
+
+This resource reflects the currently mounted secret versions for a pod.
+Reloader watches these updates and triggers a rollout when a change is detected.
+
+#### Prerequisites
+
+- Secrets Store CSI Driver must be installed in your cluster
+- Secret rotation enabled in the CSI driver.
+- Enable CSI integration in Reloader: `--enable-csi-integration=true`
+
+#### Annotations for CSI-mounted Secrets
+
+| Annotation                                                                   | Description                                                                                                                 |
+|------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
+| `reloader.stakater.com/auto: "true"`                                         | Global Discovery: Automatically discovers and reloads the workload when any mounted ConfigMap or Secret is updated.         |
+| `secretproviderclass.reloader.stakater.com/auto: 'true'`                     | CSI Discovery: Specifically watches for updates to all SecretProviderClasses used by the workload (CSI driver integration). |
+| `secretproviderclass.reloader.stakater.com/reload: "my-secretproviderclass"` | Targeted Reload: Only reloads the workload when the specifically named SecretProviderClass(es) are updated.                 |
+
+Reloader monitors changes at the **per-secret level** by watching the `SecretProviderClassPodStatus`. Make sure each secret you want to monitor is properly defined with a `secretKey` in your `SecretProviderClass`:
+
+```yaml
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: vault-reloader-demo
+  namespace: test
 spec:
-  template: metadata:
+  provider: vault
+  parameters:
+    vaultAddress: "http://vault.vault.svc:8200"
+    vaultSkipTLSVerify: "true"
+    roleName: "demo-role"
+    objects: |
+      - objectName: "password"
+        secretPath: "secret/data/reloader-demo"
+        secretKey: "password"
 ```
 
-Use comma separated list to define multiple configmaps.
+***Important***: Reloader tracks changes to individual secrets (identified by `secretKey`). If your SecretProviderClass doesn't specify `secretKey` for each object, Reloader may not detect updates correctly.
 
-```yaml
-kind: Deployment
-metadata:
-  annotations:
-    configmap.reloader.stakater.com/reload: "foo-configmap,bar-configmap,baz-configmap"
-spec:
-  template: metadata:
+#### Notes & Limitations
+
+Reloader reacts to CSI status changes, not direct updates to external secret stores
+Secret rotation must be enabled in the CSI driver for updates to be detected
+CSI limitations (such as `subPath` mounts) still apply and may require pod restarts
+If secrets are synced to Kubernetes Secret objects, standard Reloader behavior applies and CSI support may not be required
+
+## 🚀 Installation
+
+### 1. 📦 Helm
+
+Reloader can be installed in multiple ways depending on your Kubernetes setup and preference. Below are the supported methods:
+
+```bash
+helm repo add stakater https://stakater.github.io/stakater-charts
+helm repo update
+helm install reloader stakater/reloader
 ```
 
-### Secret
+➡️ See full Helm configuration in the [chart README](./deployments/kubernetes/chart/reloader/README.md).
 
-To perform rolling upgrade when change happens only on specific secrets use below annotation.
+### 2. 📄 Vanilla Manifests
 
-For a `Deployment` called `foo` have a `Secret` called `foo-secret`. Then add this annotation to main metadata of your `Deployment`
-
-```yaml
-kind: Deployment
-metadata:
-  annotations:
-    secret.reloader.stakater.com/reload: "foo-secret"
-spec:
-  template: metadata:
-```
-
-Use comma separated list to define multiple secrets.
-
-```yaml
-kind: Deployment
-metadata:
-  annotations:
-    secret.reloader.stakater.com/reload: "foo-secret,bar-secret,baz-secret"
-spec:
-  template: metadata:
-```
-
-### NOTES
-
-- Reloader also supports [sealed-secrets](https://github.com/bitnami-labs/sealed-secrets). [Here](docs/Reloader-with-Sealed-Secrets.md) are the steps to use sealed-secrets with reloader.
-- `reloader.stakater.com/auto: "true"` will only reload the pod, if the configmap or secret is used (as a volume mount or as an env) in `DeploymentConfigs/Deployment/Daemonsets/Statefulsets`
-- `secret.reloader.stakater.com/reload` or `configmap.reloader.stakater.com/reload` annotation will reload the pod upon changes in specified configmap or secret, irrespective of the usage of configmap or secret.
-- you may override the auto annotation with the `--auto-annotation` flag
-- you may override the search annotation with the `--auto-search-annotation` flag
-  and the match annotation with the `--search-match-annotation` flag
-- you may override the configmap annotation with the `--configmap-annotation` flag
-- you may override the secret annotation with the `--secret-annotation` flag
-- you may want to prevent watching certain namespaces with the `--namespaces-to-ignore` flag
-- you may want to prevent watching certain resources with the `--resources-to-ignore` flag
-- you can configure logging in JSON format with the `--log-format=json` option
-
-## Deploying to Kubernetes
-
-You can deploy Reloader by following methods:
-
-### Vanilla Manifests
-
-You can apply vanilla manifests by changing `RELEASE-NAME` placeholder provided in manifest with a proper value and apply it by running the command given below:
+Apply raw Kubernetes manifests directly:
 
 ```bash
 kubectl apply -f https://raw.githubusercontent.com/stakater/Reloader/master/deployments/kubernetes/reloader.yaml
 ```
 
-By default Reloader gets deployed in `default` namespace and watches changes `secrets` and `configmaps` in all namespaces.
+### 3. 🧱 Vanilla Kustomize
 
-Reloader can be configured to ignore the resources `secrets` and `configmaps` by passing the following args (`spec.template.spec.containers.args`) to its container :
-
-| Args                             | Description          |
-| -------------------------------- | -------------------- |
-| --resources-to-ignore=configMaps | To ignore configMaps |
-| --resources-to-ignore=secrets    | To ignore secrets    |
-
-`Note`: At one time only one of these resource can be ignored, trying to do it will cause error in Reloader. Workaround for ignoring both resources is by scaling down the reloader pods to `0`.
-
-### Vanilla kustomize
-
-You can also apply the vanilla manifests by running the following command
+Use the built-in Kustomize support:
 
 ```bash
 kubectl apply -k https://github.com/stakater/Reloader/deployments/kubernetes
 ```
 
-Similarly to vanilla manifests get deployed in `default` namespace and watches changes `secrets` and `configmaps` in all namespaces.
+### 4. 🛠️ Custom Kustomize Setup
 
-### Kustomize
-
-You can write your own `kustomization.yaml` using ours as a 'base' and write patches to tweak the configuration.
+You can create your own `kustomization.yaml` and use Reloader’s as a base:
 
 ```yaml
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-bases:
+resources:
   - https://github.com/stakater/Reloader/deployments/kubernetes
 
 namespace: reloader
 ```
 
-### Helm Charts
+### 5. ⚖️ Default Resource Requests and Limits
 
-Alternatively if you have configured helm on your cluster, you can add reloader to helm from our public chart repository and deploy it via helm using below mentioned commands. Follow [this](docs/Helm2-to-Helm3.md) guide, in case you have trouble migrating reloader from Helm2 to Helm3
+By default, Reloader is deployed with the following resource requests and limits:
 
-```bash
-helm repo add stakater https://stakater.github.io/stakater-charts
-
-helm repo update
-
-helm install stakater/reloader # For helm3 add --generate-name flag or set the release name
+```yaml
+resources:
+  limits:
+    cpu: 150m
+    memory: 512Mi
+  requests:
+    cpu: 10m
+    memory: 128Mi
 ```
 
-**Note:** By default reloader watches in all namespaces. To watch in single namespace, please run following command. It will install reloader in `test` namespace which will only watch `Deployments`, `Daemonsets` and `Statefulsets` in `test` namespace.
+### 6. ⚙️ Optional runtime configurations
+
+These flags let you customize Reloader's behavior globally, at the Reloader controller level.
+
+#### 1. 🔁 Reload Behavior
+
+| Flag | Description |
+|------|-------------|
+| `--reload-on-create=true` | Reload workloads when a watched ConfigMap or Secret is created |
+| `--reload-on-delete=true` | Reload workloads when a watched ConfigMap or Secret is deleted |
+| `--auto-reload-all=true` | Automatically reload all workloads unless opted out (`auto: "false"`) |
+| `--reload-strategy=env-vars` | Strategy to use for triggering reload (`env-vars` or `annotations`) |
+| `--log-format=json` | Enable JSON-formatted logs for better machine readability |
+
+##### Reload Strategies
+
+Reloader supports multiple strategies for triggering rolling updates when a watched `ConfigMap` or `Secret` changes. You can configure the strategy using the `--reload-strategy` flag.
+
+| Strategy     | Description |
+|--------------|-------------|
+| `env-vars` (default) | Adds a dummy environment variable to any container referencing the changed resource (e.g., `Deployment`, `StatefulSet`, etc.). This forces Kubernetes to perform a rolling update. |
+| `annotations` | Adds a `reloader.stakater.com/last-reloaded-from` annotation to the pod template metadata. Ideal for GitOps tools like ArgoCD, as it avoids triggering unwanted sync diffs. |
+
+- The `env-vars` strategy is the default and works in most setups.
+- The `annotations` strategy is preferred in **GitOps environments** to prevent config drift in tools like ArgoCD or Flux.
+- In `annotations` mode, a `ConfigMap` or `Secret` that is deleted and re-created will still trigger a reload (since previous state is not tracked).
+
+#### 2. 🚫 Resource Filtering
+
+| Flag | Description |
+|------|-------------|
+| `--resources-to-ignore=configmaps` | Ignore ConfigMaps (only one type can be ignored at a time) |
+| `--resources-to-ignore=secrets` | Ignore Secrets (cannot combine with configMaps) |
+| `--ignored-workload-types=jobs,cronjobs` | Ignore specific workload types from reload monitoring |
+| `--resource-label-selector=key=value` | Only watch ConfigMaps/Secrets with matching labels |
+
+> **⚠️ Note:**
+>
+> Only **one** resource type can be ignored at a time.
+> Trying to ignore **both `configmaps` and `secrets`** will cause an error in Reloader.
+> ✅ **Workaround:** Scale the Reloader deployment to `0` replicas if you want to disable it completely.
+
+**💡 Workload Type Examples:**
 
 ```bash
-helm install stakater/reloader --set reloader.watchGlobally=false --namespace test # For helm3 add --generate-name flag or set the release name
+# Ignore only Jobs
+--ignored-workload-types=jobs
+
+# Ignore only CronJobs
+--ignored-workload-types=cronjobs
+
+# Ignore both (comma-separated)
+--ignored-workload-types=jobs,cronjobs
 ```
 
-Reloader can be configured to ignore the resources `secrets` and `configmaps` by using the following parameters of `values.yaml` file:
+> **🔧 Use Case:** Ignoring workload types is useful when you don't want certain types of workloads to be automatically reloaded.
 
-| Parameter        | Description                                                    | Type    |
-| ---------------- | -------------------------------------------------------------- | ------- |
-| ignoreSecrets    | To ignore secrets. Valid value are either `true` or `false`    | boolean |
-| ignoreConfigMaps | To ignore configMaps. Valid value are either `true` or `false` | boolean |
+#### 3. 🧩 Namespace Filtering
 
-`Note`: At one time only one of these resource can be ignored, trying to do it will cause error in helm template compilation.
+| Flag | Description |
+|------|-------------|
+| `--namespace-selector='key=value'` <br /> <br />`--namespace-selector='key1=value1,key2=value2'` <br /> <br />`--namespace-selector='key in (value1,value2)'`| Watch only namespaces with matching labels. See [LIST and WATCH filtering](https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#list-and-watch-filtering) for more details on label selectors |
+| `--namespaces-to-ignore=ns1,ns2` | Skip specific namespaces from being watched |
 
-You can also set the log format of Reloader to json by setting `logFormat` to `json` in values.yaml and apply the chart
+#### 4. 📝 Annotation Key Overrides
 
-You can enable to scrape Reloader's Prometheus metrics by setting `serviceMonitor.enabled`  to `true` in values.yaml file.
+These flags allow you to redefine annotation keys used in your workloads or resources:
+
+| Flag | Overrides |
+|------|-----------|
+| `--auto-annotation` | Overrides `reloader.stakater.com/auto` |
+| `--secret-auto-annotation` | Overrides `secret.reloader.stakater.com/auto` |
+| `--configmap-auto-annotation` | Overrides `configmap.reloader.stakater.com/auto` |
+| `--auto-search-annotation` | Overrides `reloader.stakater.com/search` |
+| `--search-match-annotation` | Overrides `reloader.stakater.com/match` |
+| `--secret-annotation` | Overrides `secret.reloader.stakater.com/reload` |
+| `--configmap-annotation` | Overrides `configmap.reloader.stakater.com/reload` |
+| `--ignore-annotation` | Overrides `reloader.stakater.com/ignore` |
+| `--pause-deployment-annotation` | Overrides `deployment.reloader.stakater.com/pause-period` |
+| `--pause-deployment-time-annotation` | Overrides `deployment.reloader.stakater.com/paused-at` |
+
+#### 5. ⚖️ High Availability
+
+When running multiple replicas with `--enable-ha`, leadership is held through a Kubernetes Lease. These flags tune the client-go leader election timings:
+
+| Flag | Description |
+|------|-------------|
+| `--leader-election-lease-duration=15s` | Duration non-leader candidates wait before force acquiring leadership |
+| `--leader-election-renew-deadline=10s` | Duration the acting leader retries refreshing leadership before giving up |
+| `--leader-election-retry-period=2s` | Duration clients wait between attempting acquisition and renewal of leadership |
+
+The lease duration must be a whole number of seconds of at least `1s`, because it is persisted on the Lease as whole seconds and a follower judges expiry from that stored value — a fractional lease is truncated and can expire for followers before the leader reaches its renew deadline, allowing two leaders at once. It must also be greater than the renew deadline, and the renew deadline must be greater than the retry period multiplied by the jitter factor (1.2). Longer values reduce API server traffic and tolerate slower networks; shorter values shorten the failover gap after a leader is lost.
+
+#### 6. 🕷️ Debugging
+
+| Flag | Description |
+|---  |-------------|
+| `--enable-pprof` | Enables `pprof` for profiling |
+| `--pprof-addr` | Address to start `pprof` server on. Default is `:6060` |
+
+## Compatibility
+
+Reloader is compatible with Kubernetes >= 1.19
+
+## 🏢 Adopters
+
+Reloader has **24B+ Docker pulls** across thousands of Kubernetes clusters worldwide.
+
+If you're running Reloader in production, we'd love to hear from you:
+
+- 💬 **Share your story** → [Show & Tell Discussion](https://github.com/stakater/Reloader/discussions/1137)
+- 🏷️ **Add your logo** → [ADOPTERS.md](./adopters/ADOPTERS.md)
+
+[See who's using Reloader →](./adopters/ADOPTERS.md)
 
 ## Help
 
-### Documentation
-
-You can find more documentation [here](docs/)
-
 ### Have a question?
 
-File a GitHub [issue](https://github.com/stakater/Reloader/issues), or send us an [email](mailto:stakater@gmail.com).
+File a GitHub [issue](https://github.com/stakater/Reloader/issues).
 
 ### Talk to us on Slack
 
-Join and talk to us on Slack for discussing Reloader
+Join and talk to us on Slack for discussing Reloader:
 
 [![Join Slack](https://stakater.github.io/README/stakater-join-slack-btn.png)](https://slack.stakater.com/)
 [![Chat](https://stakater.github.io/README/stakater-chat-btn.png)](https://stakater-community.slack.com/messages/CC5S05S12)
 
 ## Contributing
+
+### Branches and PR titles
+
+- `master` is in feature freeze and accepts only bug fixes (`fix:`) and maintenance changes (`chore:`).
+- `v2` is the active development branch. Please open pull requests for new features against `v2`.
+
+Pull request titles must follow the [Conventional Commits](https://www.conventionalcommits.org/) format, for example `fix(chart): correct probe port`. The following prefixes are accepted on `v2`: `feat`, `fix`, `chore`, `docs`, `refactor`, `perf`, `test`, `ci`, `build` and `revert`.
 
 ### Bug Reports & Feature Requests
 
@@ -245,39 +512,52 @@ Please use the [issue tracker](https://github.com/stakater/Reloader/issues) to r
 
 ### Developing
 
-1. Deploy Reloader.
-2. Run `okteto up` to activate your development container.
-3. `make build`.
-4. `./Reloader`
+1. Deploy Reloader
+1. Run `okteto up` to activate your development container
+1. `make build`
+1. `./Reloader`
 
-PRs are welcome. In general, we follow the "fork-and-pull" Git workflow.
+PRs are welcome. In general, we follow the "fork-and-pull" Git workflow:
 
-1.  **Fork** the repo on GitHub
-2.  **Clone** the project to your own machine
-3.  **Commit** changes to your own branch
-4.  **Push** your work back up to your fork
-5.  Submit a **Pull request** so that we can review your changes
+1. **Fork** the repo on GitHub
+1. **Clone** the project to your own machine
+1. **Commit** changes to your own branch
+1. **Push** your work back up to your fork
+1. Submit a **Pull request** so that we can review your changes
 
-NOTE: Be sure to merge the latest from "upstream" before making a pull request!
+**NOTE:** Be sure to merge the latest from "upstream" before making a pull request!
+
+## Release Processes
+
+*Repository GitHub releases*: As requested by the community in [issue 685](https://github.com/stakater/Reloader/issues/685), Reloader is now based on a manual release process. Releases are no longer done on every merged PR to the main branch, but manually on request.
+
+To make a GitHub release:
+
+1. Code owners create a release branch `release-vX.Y.Z` from `master`
+1. Code owners run [Init Release](https://github.com/stakater/Reloader/actions/workflows/init-branch-release.yaml) workflow to automatically generate version and manifests on the release branch
+    - Set the `TARGET_BRANCH` parameter to release branch i.e. `release-vX.Y.Z`
+    - Set the `TARGET_VERSION` to release version without 'v' i.e. `X.Y.Z`
+1. A PR is created to bump the image version on the release branch, example: [PR-798](https://github.com/stakater/Reloader/pull/798)
+1. Code owners create a GitHub release with tag `vX.Y.Z` and target branch `release-vX.Y.Z`, which triggers creation of images
+1. Code owners create another branch from `master` and bump the helm chart version as well as Reloader image version.
+    - Code owners create a PR with `release/helm-chart` label, example: [PR-846](https://github.com/stakater/Reloader/pull/846)
+
+*Repository git tagging*: Push to the main branch will create a merge-image and merge-tag named `merge-${{ github.event.number }}`, for example `merge-800` when pull request number 800 is merged.
 
 ## Changelog
 
-View our closed [Pull Requests](https://github.com/stakater/Reloader/pulls?q=is%3Apr+is%3Aclosed).
+View the [releases page](https://github.com/stakater/Reloader/releases) to see what has changed in each release.
 
 ## License
 
-Apache2 © [Stakater](http://stakater.com)
+Apache2 © [Stakater][website]
 
-## About
+## About Stakater
 
-`Reloader` is maintained by [Stakater][website]. Like it? Please let us know at <hello@stakater.com>
+[![Get started with Stakater](https://stakater.github.io/README/stakater-github-banner.png)](https://stakater.com/?utm_source=Reloader&utm_medium=github)
 
-See [our other projects][community]
-or contact us in case of professional services and queries on <hello@stakater.com>
+`Reloader` is maintained by [Stakater][website]. Like it? Please let us know at [hello@stakater.com](hello@stakater.com)
 
-[website]: http://stakater.com/
-[community]: https://github.com/stakater/
+See [our other projects](https://github.com/stakater) or contact us in case of professional services and queries on [hello@stakater.com](hello@stakater.com)
 
-## Acknowledgements
-
-- [ConfigmapController](https://github.com/fabric8io/configmapcontroller); We documented here why we re-created [Reloader](docs/Reloader-vs-ConfigmapController.md)
+[website]: https://stakater.com

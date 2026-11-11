@@ -1,1178 +1,982 @@
 package controller
 
 import (
-	"os"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
-	"github.com/stakater/Reloader/internal/pkg/metrics"
-
-	"github.com/sirupsen/logrus"
-	"github.com/stakater/Reloader/internal/pkg/constants"
-	"github.com/stakater/Reloader/internal/pkg/handler"
-	"github.com/stakater/Reloader/internal/pkg/options"
-	"github.com/stakater/Reloader/internal/pkg/testutil"
-	"github.com/stakater/Reloader/internal/pkg/util"
-	"github.com/stakater/Reloader/pkg/kube"
-	"k8s.io/client-go/kubernetes"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
+
+	"github.com/stakater/Reloader/internal/pkg/handler"
+	"github.com/stakater/Reloader/internal/pkg/metrics"
+	"github.com/stakater/Reloader/internal/pkg/options"
+	"github.com/stakater/Reloader/pkg/common"
 )
 
-var (
-	clients             = kube.GetClients()
-	namespace           = "test-reloader-" + testutil.RandSeq(5)
-	configmapNamePrefix = "testconfigmap-reloader"
-	secretNamePrefix    = "testsecret-reloader"
-	data                = "dGVzdFNlY3JldEVuY29kaW5nRm9yUmVsb2FkZXI="
-	newData             = "dGVzdE5ld1NlY3JldEVuY29kaW5nRm9yUmVsb2FkZXI="
-	updatedData         = "dGVzdFVwZGF0ZWRTZWNyZXRFbmNvZGluZ0ZvclJlbG9hZGVy"
-	collectors          = metrics.NewCollectors()
-)
-
-const (
-	sleepDuration = 3 * time.Second
-)
-
-func TestMain(m *testing.M) {
-
-	testutil.CreateNamespace(namespace, clients.KubernetesClient)
-
-	logrus.Infof("Creating controller")
-	for k := range kube.ResourceMap {
-		c, err := NewController(clients.KubernetesClient, k, namespace, []string{}, collectors)
-		if err != nil {
-			logrus.Fatalf("%s", err)
-		}
-
-		// Now let's start the controller
-		stop := make(chan struct{})
-		defer close(stop)
-		go c.Run(1, stop)
-	}
-	time.Sleep(sleepDuration)
-
-	logrus.Infof("Running Testcases")
-	retCode := m.Run()
-
-	testutil.DeleteNamespace(namespace, clients.KubernetesClient)
-
-	os.Exit(retCode)
+// mockResourceHandler implements handler.ResourceHandler and handler.TimedHandler for testing.
+type mockResourceHandler struct {
+	handleErr   error
+	handleCalls int
+	enqueueTime time.Time
 }
 
-// Perform rolling upgrade on deploymentConfig and create env var upon updating the configmap
-func TestControllerUpdatingConfigmapShouldCreateEnvInDeploymentConfig(t *testing.T) {
-	// Don't run test on non-openshift environment
-	if !kube.IsOpenshift {
-		return
-	}
-
-	// Creating configmap
-	configmapName := configmapNamePrefix + "-update-" + testutil.RandSeq(5)
-	configmapClient, err := testutil.CreateConfigMap(clients.KubernetesClient, namespace, configmapName, "www.google.com")
-	if err != nil {
-		t.Errorf("Error while creating the configmap %v", err)
-	}
-
-	// Creating deployment
-	_, err = testutil.CreateDeploymentConfig(clients.OpenshiftAppsClient, configmapName, namespace, true)
-	if err != nil {
-		t.Errorf("Error in deploymentConfig creation: %v", err)
-	}
-
-	// Updating configmap for first time
-	updateErr := testutil.UpdateConfigMap(configmapClient, namespace, configmapName, "", "www.stakater.com")
-	if updateErr != nil {
-		t.Errorf("Configmap was not updated")
-	}
-
-	// Verifying deployment update
-	logrus.Infof("Verifying env var has been created")
-	shaData := testutil.ConvertResourceToSHA(testutil.ConfigmapResourceType, namespace, configmapName, "www.stakater.com")
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: configmapName,
-		SHAValue:     shaData,
-		Annotation:   options.ConfigmapUpdateOnChangeAnnotation,
-	}
-	deploymentConfigFuncs := handler.GetDeploymentConfigRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.ConfigmapEnvVarPostfix, deploymentConfigFuncs)
-	if !updated {
-		t.Errorf("DeploymentConfig was not updated")
-	}
-	time.Sleep(sleepDuration)
-
-	// Deleting deployment
-	err = testutil.DeleteDeploymentConfig(clients.OpenshiftAppsClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the deploymentConfig %v", err)
-	}
-
-	// Deleting configmap
-	err = testutil.DeleteConfigMap(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the configmap %v", err)
-	}
-	time.Sleep(sleepDuration)
+func (m *mockResourceHandler) Handle() error {
+	m.handleCalls++
+	return m.handleErr
 }
 
-// Perform rolling upgrade on deployment and create env var upon updating the configmap
-func TestControllerUpdatingConfigmapShouldCreateEnvInDeployment(t *testing.T) {
-
-	// Creating configmap
-	configmapName := configmapNamePrefix + "-update-" + testutil.RandSeq(5)
-	configmapClient, err := testutil.CreateConfigMap(clients.KubernetesClient, namespace, configmapName, "www.google.com")
-	if err != nil {
-		t.Errorf("Error while creating the configmap %v", err)
-	}
-
-	// Creating deployment
-	_, err = testutil.CreateDeployment(clients.KubernetesClient, configmapName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in deployment creation: %v", err)
-	}
-
-	// Updating configmap for first time
-	updateErr := testutil.UpdateConfigMap(configmapClient, namespace, configmapName, "", "www.stakater.com")
-	if updateErr != nil {
-		t.Errorf("Configmap was not updated")
-	}
-
-	// Verifying deployment update
-	logrus.Infof("Verifying env var has been created")
-	shaData := testutil.ConvertResourceToSHA(testutil.ConfigmapResourceType, namespace, configmapName, "www.stakater.com")
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: configmapName,
-		SHAValue:     shaData,
-		Annotation:   options.ConfigmapUpdateOnChangeAnnotation,
-	}
-	deploymentFuncs := handler.GetDeploymentRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.ConfigmapEnvVarPostfix, deploymentFuncs)
-	if !updated {
-		t.Errorf("Deployment was not updated")
-	}
-	time.Sleep(sleepDuration)
-
-	// Deleting deployment
-	err = testutil.DeleteDeployment(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the deployment %v", err)
-	}
-
-	// Deleting configmap
-	err = testutil.DeleteConfigMap(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the configmap %v", err)
-	}
-	time.Sleep(sleepDuration)
+func (m *mockResourceHandler) GetConfig() (common.Config, string) {
+	return common.Config{
+		ResourceName: "test-resource",
+		Namespace:    "test-ns",
+		Type:         "configmap",
+		SHAValue:     "sha256:test",
+	}, "test-resource"
 }
 
-// Perform rolling upgrade on deployment and create env var upon updating the configmap
-func TestControllerUpdatingConfigmapShouldAutoCreateEnvInDeployment(t *testing.T) {
-
-	// Creating configmap
-	configmapName := configmapNamePrefix + "-update-" + testutil.RandSeq(5)
-	configmapClient, err := testutil.CreateConfigMap(clients.KubernetesClient, namespace, configmapName, "www.google.com")
-	if err != nil {
-		t.Errorf("Error while creating the configmap %v", err)
-	}
-
-	// Creating deployment
-	_, err = testutil.CreateDeployment(clients.KubernetesClient, configmapName, namespace, false)
-	if err != nil {
-		t.Errorf("Error  in deployment creation: %v", err)
-	}
-
-	// Updating configmap for first time
-	updateErr := testutil.UpdateConfigMap(configmapClient, namespace, configmapName, "", "www.stakater.com")
-	if updateErr != nil {
-		t.Errorf("Configmap was not updated")
-	}
-
-	// Verifying deployment update
-	logrus.Infof("Verifying env var has been created")
-	shaData := testutil.ConvertResourceToSHA(testutil.ConfigmapResourceType, namespace, configmapName, "www.stakater.com")
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: configmapName,
-		SHAValue:     shaData,
-		Annotation:   options.ConfigmapUpdateOnChangeAnnotation,
-	}
-	deploymentFuncs := handler.GetDeploymentRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.ConfigmapEnvVarPostfix, deploymentFuncs)
-	if !updated {
-		t.Errorf("Deployment was not updated")
-	}
-	time.Sleep(sleepDuration)
-
-	// Deleting deployment
-	err = testutil.DeleteDeployment(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the deployment %v", err)
-	}
-
-	// Deleting configmap
-	err = testutil.DeleteConfigMap(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the configmap %v", err)
-	}
-	time.Sleep(sleepDuration)
+func (m *mockResourceHandler) GetEnqueueTime() time.Time {
+	return m.enqueueTime
 }
 
-// Perform rolling upgrade on deployment and create env var upon creating the configmap
-func TestControllerCreatingConfigmapShouldCreateEnvInDeployment(t *testing.T) {
-
-	// TODO: Fix this test case
-	t.Skip("Skipping TestControllerCreatingConfigmapShouldCreateEnvInDeployment test case")
-
-	// Creating configmap
-	configmapName := configmapNamePrefix + "-create-" + testutil.RandSeq(5)
-	_, err := testutil.CreateConfigMap(clients.KubernetesClient, namespace, configmapName, "www.google.com")
-	if err != nil {
-		t.Errorf("Error while creating the configmap %v", err)
-	}
-
-	// Creating deployment
-	_, err = testutil.CreateDeployment(clients.KubernetesClient, configmapName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in deployment creation: %v", err)
-	}
-
-	// Deleting configmap for first time
-	err = testutil.DeleteConfigMap(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the configmap %v", err)
-	}
-
-	time.Sleep(sleepDuration)
-
-	_, err = testutil.CreateConfigMap(clients.KubernetesClient, namespace, configmapName, "www.stakater.com")
-	if err != nil {
-		t.Errorf("Error while creating the configmap second time %v", err)
-	}
-
-	time.Sleep(sleepDuration)
-
-	// Verifying deployment update
-	logrus.Infof("Verifying env var has been created")
-	shaData := testutil.ConvertResourceToSHA(testutil.ConfigmapResourceType, namespace, configmapName, "www.stakater.com")
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: configmapName,
-		SHAValue:     shaData,
-		Annotation:   options.ConfigmapUpdateOnChangeAnnotation,
-	}
-	deploymentFuncs := handler.GetDeploymentRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.ConfigmapEnvVarPostfix, deploymentFuncs)
-	if !updated {
-		t.Errorf("Deployment was not updated")
-	}
-	time.Sleep(sleepDuration)
-
-	// Deleting deployment
-	err = testutil.DeleteDeployment(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the deployment %v", err)
-	}
-
-	// Deleting configmap
-	err = testutil.DeleteConfigMap(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the configmap %v", err)
-	}
-	time.Sleep(sleepDuration)
+// resetGlobalState resets global variables between tests
+func resetGlobalState() {
+	secretControllerInitialized.Store(false)
+	configmapControllerInitialized.Store(false)
+	storeSelectedNamespaces([]string{})
 }
 
-// Perform rolling upgrade on deployment and update env var upon updating the configmap
-func TestControllerForUpdatingConfigmapShouldUpdateDeployment(t *testing.T) {
-	// Creating secret
-	configmapName := configmapNamePrefix + "-update-" + testutil.RandSeq(5)
-	configmapClient, err := testutil.CreateConfigMap(clients.KubernetesClient, namespace, configmapName, "www.google.com")
-	if err != nil {
-		t.Errorf("Error while creating the configmap %v", err)
-	}
+// newTestController creates a controller for testing without starting informers
+func newTestController(ignoredNamespaces []string, namespaceSelector string) *Controller {
+	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[any]())
+	collectors := metrics.NewCollectors()
 
-	// Creating deployment
-	_, err = testutil.CreateDeployment(clients.KubernetesClient, configmapName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in deployment creation: %v", err)
+	return &Controller{
+		queue:             queue,
+		ignoredNamespaces: ignoredNamespaces,
+		namespaceSelector: namespaceSelector,
+		collectors:        collectors,
+		resource:          "configmaps",
 	}
-
-	// Updating configmap for first time
-	updateErr := testutil.UpdateConfigMap(configmapClient, namespace, configmapName, "", "www.stakater.com")
-	if updateErr != nil {
-		t.Errorf("Configmap was not updated")
-	}
-
-	// Updating configmap for second time
-	updateErr = testutil.UpdateConfigMap(configmapClient, namespace, configmapName, "", "aurorasolutions.io")
-	if updateErr != nil {
-		t.Errorf("Configmap was not updated")
-	}
-
-	// Verifying deployment update
-	logrus.Infof("Verifying env var has been updated")
-	shaData := testutil.ConvertResourceToSHA(testutil.ConfigmapResourceType, namespace, configmapName, "aurorasolutions.io")
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: configmapName,
-		SHAValue:     shaData,
-		Annotation:   options.ConfigmapUpdateOnChangeAnnotation,
-	}
-
-	deploymentFuncs := handler.GetDeploymentRollingUpgradeFuncs()
-
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.ConfigmapEnvVarPostfix, deploymentFuncs)
-	if !updated {
-		t.Errorf("Deployment was not updated")
-	}
-	time.Sleep(sleepDuration)
-
-	// Deleting deployment
-	err = testutil.DeleteDeployment(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the deployment %v", err)
-	}
-
-	// Deleting configmap
-	err = testutil.DeleteConfigMap(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the configmap %v", err)
-	}
-	time.Sleep(sleepDuration)
 }
 
-// Do not Perform rolling upgrade on deployment and create env var upon updating the labels configmap
-func TestControllerUpdatingConfigmapLabelsShouldNotCreateOrUpdateEnvInDeployment(t *testing.T) {
-	// Creating configmap
-	configmapName := configmapNamePrefix + "-update-" + testutil.RandSeq(5)
-	configmapClient, err := testutil.CreateConfigMap(clients.KubernetesClient, namespace, configmapName, "www.google.com")
-	if err != nil {
-		t.Errorf("Error while creating the configmap %v", err)
-	}
-
-	// Creating deployment
-	_, err = testutil.CreateDeployment(clients.KubernetesClient, configmapName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in deployment creation: %v", err)
-	}
-
-	// Updating configmap for first time
-	updateErr := testutil.UpdateConfigMap(configmapClient, namespace, configmapName, "test", "www.google.com")
-	if updateErr != nil {
-		t.Errorf("Configmap was not updated")
-	}
-
-	// Verifying deployment update
-	logrus.Infof("Verifying env var has been created")
-	shaData := testutil.ConvertResourceToSHA(testutil.ConfigmapResourceType, namespace, configmapName, "www.google.com")
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: configmapName,
-		SHAValue:     shaData,
-		Annotation:   options.ConfigmapUpdateOnChangeAnnotation,
-	}
-	deploymentFuncs := handler.GetDeploymentRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.ConfigmapEnvVarPostfix, deploymentFuncs)
-	if updated {
-		t.Errorf("Deployment should not be updated by changing label")
-	}
-	time.Sleep(sleepDuration)
-
-	// Deleting deployment
-	err = testutil.DeleteDeployment(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the deployment %v", err)
-	}
-
-	// Deleting configmap
-	err = testutil.DeleteConfigMap(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the configmap %v", err)
-	}
-	time.Sleep(sleepDuration)
-}
-
-// Perform rolling upgrade on pod and create a env var upon creating the secret
-func TestControllerCreatingSecretShouldCreateEnvInDeployment(t *testing.T) {
-
-	// TODO: Fix this test case
-	t.Skip("Skipping TestControllerCreatingConfigmapShouldCreateEnvInDeployment test case")
-
-	// Creating secret
-	secretName := secretNamePrefix + "-create-" + testutil.RandSeq(5)
-	_, err := testutil.CreateSecret(clients.KubernetesClient, namespace, secretName, data)
-	if err != nil {
-		t.Errorf("Error  in secret creation: %v", err)
-	}
-
-	// Creating deployment
-	_, err = testutil.CreateDeployment(clients.KubernetesClient, secretName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in deployment creation: %v", err)
-	}
-
-	//Deleting Secret
-	err = testutil.DeleteSecret(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the secret %v", err)
-	}
-	time.Sleep(sleepDuration)
-
-	_, err = testutil.CreateSecret(clients.KubernetesClient, namespace, secretName, newData)
-	if err != nil {
-		t.Errorf("Error  in secret creation: %v", err)
-	}
-
-	time.Sleep(sleepDuration)
-
-	// Verifying Upgrade
-	logrus.Infof("Verifying env var has been created")
-	shaData := testutil.ConvertResourceToSHA(testutil.SecretResourceType, namespace, secretName, newData)
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: secretName,
-		SHAValue:     shaData,
-		Annotation:   options.SecretUpdateOnChangeAnnotation,
-	}
-	deploymentFuncs := handler.GetDeploymentRollingUpgradeFuncs()
-	time.Sleep(sleepDuration)
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.SecretEnvVarPostfix, deploymentFuncs)
-	if !updated {
-		t.Errorf("Deployment was not updated")
-	}
-
-	// Deleting Deployment
-	err = testutil.DeleteDeployment(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the deployment %v", err)
-	}
-
-	//Deleting Secret
-	err = testutil.DeleteSecret(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the secret %v", err)
-	}
-	time.Sleep(sleepDuration)
-}
-
-// Perform rolling upgrade on pod and create a env var upon updating the secret
-func TestControllerUpdatingSecretShouldCreateEnvInDeployment(t *testing.T) {
-	// Creating secret
-	secretName := secretNamePrefix + "-update-" + testutil.RandSeq(5)
-	secretClient, err := testutil.CreateSecret(clients.KubernetesClient, namespace, secretName, data)
-	if err != nil {
-		t.Errorf("Error  in secret creation: %v", err)
-	}
-
-	// Creating deployment
-	_, err = testutil.CreateDeployment(clients.KubernetesClient, secretName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in deployment creation: %v", err)
-	}
-
-	// Updating Secret
-	err = testutil.UpdateSecret(secretClient, namespace, secretName, "", newData)
-	if err != nil {
-		t.Errorf("Error while updating secret %v", err)
-	}
-
-	// Verifying Upgrade
-	logrus.Infof("Verifying env var has been created")
-	shaData := testutil.ConvertResourceToSHA(testutil.SecretResourceType, namespace, secretName, newData)
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: secretName,
-		SHAValue:     shaData,
-		Annotation:   options.SecretUpdateOnChangeAnnotation,
-	}
-	deploymentFuncs := handler.GetDeploymentRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.SecretEnvVarPostfix, deploymentFuncs)
-	if !updated {
-		t.Errorf("Deployment was not updated")
-	}
-
-	// Deleting Deployment
-	err = testutil.DeleteDeployment(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the deployment %v", err)
-	}
-
-	//Deleting Secret
-	err = testutil.DeleteSecret(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the secret %v", err)
-	}
-	time.Sleep(sleepDuration)
-}
-
-// Perform rolling upgrade on deployment and update env var upon updating the secret
-func TestControllerUpdatingSecretShouldUpdateEnvInDeployment(t *testing.T) {
-	// Creating secret
-	secretName := secretNamePrefix + "-update-" + testutil.RandSeq(5)
-	secretClient, err := testutil.CreateSecret(clients.KubernetesClient, namespace, secretName, data)
-	if err != nil {
-		t.Errorf("Error  in secret creation: %v", err)
-	}
-
-	// Creating deployment
-	_, err = testutil.CreateDeployment(clients.KubernetesClient, secretName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in deployment creation: %v", err)
-	}
-
-	// Updating Secret
-	err = testutil.UpdateSecret(secretClient, namespace, secretName, "", newData)
-	if err != nil {
-		t.Errorf("Error while updating secret %v", err)
-	}
-
-	// Updating Secret
-	err = testutil.UpdateSecret(secretClient, namespace, secretName, "", updatedData)
-	if err != nil {
-		t.Errorf("Error while updating secret %v", err)
-	}
-
-	// Verifying Upgrade
-	logrus.Infof("Verifying env var has been updated")
-	shaData := testutil.ConvertResourceToSHA(testutil.SecretResourceType, namespace, secretName, updatedData)
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: secretName,
-		SHAValue:     shaData,
-		Annotation:   options.SecretUpdateOnChangeAnnotation,
-	}
-	deploymentFuncs := handler.GetDeploymentRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.SecretEnvVarPostfix, deploymentFuncs)
-	if !updated {
-		t.Errorf("Deployment was not updated")
-	}
-
-	// Deleting Deployment
-	err = testutil.DeleteDeployment(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the deployment %v", err)
-	}
-
-	//Deleting Secret
-	err = testutil.DeleteSecret(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the secret %v", err)
-	}
-	time.Sleep(sleepDuration)
-}
-
-// Do not Perform rolling upgrade on pod and create or update a env var upon updating the label in secret
-func TestControllerUpdatingSecretLabelsShouldNotCreateOrUpdateEnvInDeployment(t *testing.T) {
-	// Creating secret
-	secretName := secretNamePrefix + "-update-" + testutil.RandSeq(5)
-	secretClient, err := testutil.CreateSecret(clients.KubernetesClient, namespace, secretName, data)
-	if err != nil {
-		t.Errorf("Error  in secret creation: %v", err)
-	}
-
-	// Creating deployment
-	_, err = testutil.CreateDeployment(clients.KubernetesClient, secretName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in deployment creation: %v", err)
-	}
-
-	err = testutil.UpdateSecret(secretClient, namespace, secretName, "test", data)
-	if err != nil {
-		t.Errorf("Error while updating secret %v", err)
-	}
-
-	// Verifying Upgrade
-	logrus.Infof("Verifying env var has been created")
-	shaData := testutil.ConvertResourceToSHA(testutil.SecretResourceType, namespace, secretName, data)
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: secretName,
-		SHAValue:     shaData,
-		Annotation:   options.SecretUpdateOnChangeAnnotation,
-	}
-	deploymentFuncs := handler.GetDeploymentRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.SecretEnvVarPostfix, deploymentFuncs)
-	if updated {
-		t.Errorf("Deployment should not be updated by changing label in secret")
-	}
-
-	// Deleting Deployment
-	err = testutil.DeleteDeployment(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the deployment %v", err)
-	}
-
-	//Deleting Secret
-	err = testutil.DeleteSecret(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the secret %v", err)
-	}
-	time.Sleep(sleepDuration)
-}
-
-// Perform rolling upgrade on DaemonSet and create env var upon updating the configmap
-func TestControllerUpdatingConfigmapShouldCreateEnvInDaemonSet(t *testing.T) {
-	// Creating configmap
-	configmapName := configmapNamePrefix + "-update-" + testutil.RandSeq(5)
-	configmapClient, err := testutil.CreateConfigMap(clients.KubernetesClient, namespace, configmapName, "www.google.com")
-	if err != nil {
-		t.Errorf("Error while creating the configmap %v", err)
-	}
-
-	// Creating DaemonSet
-	_, err = testutil.CreateDaemonSet(clients.KubernetesClient, configmapName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in DaemonSet creation: %v", err)
-	}
-
-	// Updating configmap for first time
-	updateErr := testutil.UpdateConfigMap(configmapClient, namespace, configmapName, "", "www.stakater.com")
-	if updateErr != nil {
-		t.Errorf("Configmap was not updated")
-	}
-
-	// Verifying DaemonSet update
-	logrus.Infof("Verifying env var has been created")
-	shaData := testutil.ConvertResourceToSHA(testutil.ConfigmapResourceType, namespace, configmapName, "www.stakater.com")
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: configmapName,
-		SHAValue:     shaData,
-		Annotation:   options.ConfigmapUpdateOnChangeAnnotation,
-	}
-	daemonSetFuncs := handler.GetDaemonSetRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.ConfigmapEnvVarPostfix, daemonSetFuncs)
-	if !updated {
-		t.Errorf("DaemonSet was not updated")
-	}
-	time.Sleep(sleepDuration)
-
-	// Deleting DaemonSet
-	err = testutil.DeleteDaemonSet(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the DaemonSet %v", err)
-	}
-
-	// Deleting configmap
-	err = testutil.DeleteConfigMap(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the configmap %v", err)
-	}
-	time.Sleep(sleepDuration)
-}
-
-// Perform rolling upgrade on DaemonSet and update env var upon updating the configmap
-func TestControllerForUpdatingConfigmapShouldUpdateDaemonSet(t *testing.T) {
-	// Creating secret
-	configmapName := configmapNamePrefix + "-update-" + testutil.RandSeq(5)
-	configmapClient, err := testutil.CreateConfigMap(clients.KubernetesClient, namespace, configmapName, "www.google.com")
-	if err != nil {
-		t.Errorf("Error while creating the configmap %v", err)
-	}
-
-	// Creating DaemonSet
-	_, err = testutil.CreateDaemonSet(clients.KubernetesClient, configmapName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in DaemonSet creation: %v", err)
-	}
-
-	// Updating configmap for first time
-	updateErr := testutil.UpdateConfigMap(configmapClient, namespace, configmapName, "", "www.stakater.com")
-	if updateErr != nil {
-		t.Errorf("Configmap was not updated")
-	}
-
-	time.Sleep(sleepDuration)
-
-	// Updating configmap for second time
-	updateErr = testutil.UpdateConfigMap(configmapClient, namespace, configmapName, "", "aurorasolutions.io")
-	if updateErr != nil {
-		t.Errorf("Configmap was not updated")
-	}
-
-	time.Sleep(sleepDuration)
-
-	// Verifying DaemonSet update
-	logrus.Infof("Verifying env var has been updated")
-	shaData := testutil.ConvertResourceToSHA(testutil.ConfigmapResourceType, namespace, configmapName, "aurorasolutions.io")
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: configmapName,
-		SHAValue:     shaData,
-		Annotation:   options.ConfigmapUpdateOnChangeAnnotation,
-	}
-	daemonSetFuncs := handler.GetDaemonSetRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.ConfigmapEnvVarPostfix, daemonSetFuncs)
-	if !updated {
-		t.Errorf("DaemonSet was not updated")
-	}
-	time.Sleep(sleepDuration)
-
-	// Deleting DaemonSet
-	err = testutil.DeleteDaemonSet(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the DaemonSet %v", err)
-	}
-
-	// Deleting configmap
-	err = testutil.DeleteConfigMap(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the configmap %v", err)
-	}
-	time.Sleep(sleepDuration)
-}
-
-// Perform rolling upgrade on pod and create a env var upon updating the secret
-func TestControllerUpdatingSecretShouldCreateEnvInDaemonSet(t *testing.T) {
-	// Creating secret
-	secretName := secretNamePrefix + "-update-" + testutil.RandSeq(5)
-	secretClient, err := testutil.CreateSecret(clients.KubernetesClient, namespace, secretName, data)
-	if err != nil {
-		t.Errorf("Error  in secret creation: %v", err)
-	}
-
-	// Creating DaemonSet
-	_, err = testutil.CreateDaemonSet(clients.KubernetesClient, secretName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in DaemonSet creation: %v", err)
-	}
-
-	// Updating Secret
-	err = testutil.UpdateSecret(secretClient, namespace, secretName, "", newData)
-	if err != nil {
-		t.Errorf("Error while updating secret %v", err)
-	}
-
-	// Verifying Upgrade
-	logrus.Infof("Verifying env var has been created")
-	shaData := testutil.ConvertResourceToSHA(testutil.SecretResourceType, namespace, secretName, newData)
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: secretName,
-		SHAValue:     shaData,
-		Annotation:   options.SecretUpdateOnChangeAnnotation,
-	}
-	daemonSetFuncs := handler.GetDaemonSetRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.SecretEnvVarPostfix, daemonSetFuncs)
-	if !updated {
-		t.Errorf("DaemonSet was not updated")
-	}
-
-	// Deleting DaemonSet
-	err = testutil.DeleteDaemonSet(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the DaemonSet %v", err)
-	}
-
-	//Deleting Secret
-	err = testutil.DeleteSecret(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the secret %v", err)
-	}
-	time.Sleep(sleepDuration)
-}
-
-// Perform rolling upgrade on DaemonSet and update env var upon updating the secret
-func TestControllerUpdatingSecretShouldUpdateEnvInDaemonSet(t *testing.T) {
-	// Creating secret
-	secretName := secretNamePrefix + "-update-" + testutil.RandSeq(5)
-	secretClient, err := testutil.CreateSecret(clients.KubernetesClient, namespace, secretName, data)
-	if err != nil {
-		t.Errorf("Error  in secret creation: %v", err)
-	}
-
-	// Creating DaemonSet
-	_, err = testutil.CreateDaemonSet(clients.KubernetesClient, secretName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in DaemonSet creation: %v", err)
-	}
-
-	// Updating Secret
-	err = testutil.UpdateSecret(secretClient, namespace, secretName, "", newData)
-	if err != nil {
-		t.Errorf("Error while updating secret %v", err)
-	}
-	time.Sleep(sleepDuration)
-
-	// Updating Secret
-	err = testutil.UpdateSecret(secretClient, namespace, secretName, "", updatedData)
-	if err != nil {
-		t.Errorf("Error while updating secret %v", err)
-	}
-
-	// Verifying Upgrade
-	logrus.Infof("Verifying env var has been updated")
-	shaData := testutil.ConvertResourceToSHA(testutil.SecretResourceType, namespace, secretName, updatedData)
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: secretName,
-		SHAValue:     shaData,
-		Annotation:   options.SecretUpdateOnChangeAnnotation,
-	}
-	daemonSetFuncs := handler.GetDaemonSetRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.SecretEnvVarPostfix, daemonSetFuncs)
-	if !updated {
-		t.Errorf("DaemonSet was not updated")
-	}
-
-	// Deleting DaemonSet
-	err = testutil.DeleteDaemonSet(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the DaemonSet %v", err)
-	}
-
-	//Deleting Secret
-	err = testutil.DeleteSecret(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the secret %v", err)
-	}
-	time.Sleep(sleepDuration)
-}
-
-// Do not Perform rolling upgrade on pod and create or update a env var upon updating the label in secret
-func TestControllerUpdatingSecretLabelsShouldNotCreateOrUpdateEnvInDaemonSet(t *testing.T) {
-	// Creating secret
-	secretName := secretNamePrefix + "-update-" + testutil.RandSeq(5)
-	secretClient, err := testutil.CreateSecret(clients.KubernetesClient, namespace, secretName, data)
-	if err != nil {
-		t.Errorf("Error  in secret creation: %v", err)
-	}
-
-	// Creating DaemonSet
-	_, err = testutil.CreateDaemonSet(clients.KubernetesClient, secretName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in DaemonSet creation: %v", err)
-	}
-
-	err = testutil.UpdateSecret(secretClient, namespace, secretName, "test", data)
-	if err != nil {
-		t.Errorf("Error while updating secret %v", err)
-	}
-
-	// Verifying Upgrade
-	logrus.Infof("Verifying env var has been created")
-	shaData := testutil.ConvertResourceToSHA(testutil.SecretResourceType, namespace, secretName, data)
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: secretName,
-		SHAValue:     shaData,
-		Annotation:   options.SecretUpdateOnChangeAnnotation,
-	}
-	daemonSetFuncs := handler.GetDaemonSetRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.SecretEnvVarPostfix, daemonSetFuncs)
-	if updated {
-		t.Errorf("DaemonSet should not be updated by changing label in secret")
-	}
-
-	// Deleting DaemonSet
-	err = testutil.DeleteDaemonSet(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the DaemonSet %v", err)
-	}
-
-	//Deleting Secret
-	err = testutil.DeleteSecret(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the secret %v", err)
-	}
-	time.Sleep(sleepDuration)
-}
-
-// Perform rolling upgrade on StatefulSet and create env var upon updating the configmap
-func TestControllerUpdatingConfigmapShouldCreateEnvInStatefulSet(t *testing.T) {
-	// Creating configmap
-	configmapName := configmapNamePrefix + "-update-" + testutil.RandSeq(5)
-	configmapClient, err := testutil.CreateConfigMap(clients.KubernetesClient, namespace, configmapName, "www.google.com")
-	if err != nil {
-		t.Errorf("Error while creating the configmap %v", err)
-	}
-
-	// Creating StatefulSet
-	_, err = testutil.CreateStatefulSet(clients.KubernetesClient, configmapName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in StatefulSet creation: %v", err)
-	}
-
-	// Updating configmap for first time
-	updateErr := testutil.UpdateConfigMap(configmapClient, namespace, configmapName, "", "www.stakater.com")
-	if updateErr != nil {
-		t.Errorf("Configmap was not updated")
-	}
-
-	// Verifying StatefulSet update
-	logrus.Infof("Verifying env var has been created")
-	shaData := testutil.ConvertResourceToSHA(testutil.ConfigmapResourceType, namespace, configmapName, "www.stakater.com")
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: configmapName,
-		SHAValue:     shaData,
-		Annotation:   options.ConfigmapUpdateOnChangeAnnotation,
-	}
-	statefulSetFuncs := handler.GetStatefulSetRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.ConfigmapEnvVarPostfix, statefulSetFuncs)
-	if !updated {
-		t.Errorf("StatefulSet was not updated")
-	}
-	time.Sleep(sleepDuration)
-
-	// Deleting StatefulSet
-	err = testutil.DeleteStatefulSet(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the StatefulSet %v", err)
-	}
-
-	// Deleting configmap
-	err = testutil.DeleteConfigMap(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the configmap %v", err)
-	}
-	time.Sleep(sleepDuration)
-}
-
-// Perform rolling upgrade on StatefulSet and update env var upon updating the configmap
-func TestControllerForUpdatingConfigmapShouldUpdateStatefulSet(t *testing.T) {
-	// Creating secret
-	configmapName := configmapNamePrefix + "-update-" + testutil.RandSeq(5)
-	configmapClient, err := testutil.CreateConfigMap(clients.KubernetesClient, namespace, configmapName, "www.google.com")
-	if err != nil {
-		t.Errorf("Error while creating the configmap %v", err)
-	}
-
-	// Creating StatefulSet
-	_, err = testutil.CreateStatefulSet(clients.KubernetesClient, configmapName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in StatefulSet creation: %v", err)
-	}
-
-	// Updating configmap for first time
-	updateErr := testutil.UpdateConfigMap(configmapClient, namespace, configmapName, "", "www.stakater.com")
-	if updateErr != nil {
-		t.Errorf("Configmap was not updated")
-	}
-
-	// Updating configmap for second time
-	updateErr = testutil.UpdateConfigMap(configmapClient, namespace, configmapName, "", "aurorasolutions.io")
-	if updateErr != nil {
-		t.Errorf("Configmap was not updated")
-	}
-
-	// Verifying StatefulSet update
-	logrus.Infof("Verifying env var has been updated")
-	shaData := testutil.ConvertResourceToSHA(testutil.ConfigmapResourceType, namespace, configmapName, "aurorasolutions.io")
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: configmapName,
-		SHAValue:     shaData,
-		Annotation:   options.ConfigmapUpdateOnChangeAnnotation,
-	}
-	statefulSetFuncs := handler.GetStatefulSetRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.ConfigmapEnvVarPostfix, statefulSetFuncs)
-	if !updated {
-		t.Errorf("StatefulSet was not updated")
-	}
-	time.Sleep(sleepDuration)
-
-	// Deleting StatefulSet
-	err = testutil.DeleteStatefulSet(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the StatefulSet %v", err)
-	}
-
-	// Deleting configmap
-	err = testutil.DeleteConfigMap(clients.KubernetesClient, namespace, configmapName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the configmap %v", err)
-	}
-	time.Sleep(sleepDuration)
-}
-
-// Perform rolling upgrade on pod and create a env var upon updating the secret
-func TestControllerUpdatingSecretShouldCreateEnvInStatefulSet(t *testing.T) {
-	// Creating secret
-	secretName := secretNamePrefix + "-update-" + testutil.RandSeq(5)
-	secretClient, err := testutil.CreateSecret(clients.KubernetesClient, namespace, secretName, data)
-	if err != nil {
-		t.Errorf("Error  in secret creation: %v", err)
-	}
-
-	// Creating StatefulSet
-	_, err = testutil.CreateStatefulSet(clients.KubernetesClient, secretName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in StatefulSet creation: %v", err)
-	}
-
-	// Updating Secret
-	err = testutil.UpdateSecret(secretClient, namespace, secretName, "", newData)
-	if err != nil {
-		t.Errorf("Error while updating secret %v", err)
-	}
-
-	// Verifying Upgrade
-	logrus.Infof("Verifying env var has been created")
-	shaData := testutil.ConvertResourceToSHA(testutil.SecretResourceType, namespace, secretName, newData)
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: secretName,
-		SHAValue:     shaData,
-		Annotation:   options.SecretUpdateOnChangeAnnotation,
-	}
-	statefulSetFuncs := handler.GetStatefulSetRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.SecretEnvVarPostfix, statefulSetFuncs)
-	if !updated {
-		t.Errorf("StatefulSet was not updated")
-	}
-
-	// Deleting StatefulSet
-	err = testutil.DeleteStatefulSet(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the StatefulSet %v", err)
-	}
-
-	//Deleting Secret
-	err = testutil.DeleteSecret(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the secret %v", err)
-	}
-	time.Sleep(sleepDuration)
-}
-
-// Perform rolling upgrade on StatefulSet and update env var upon updating the secret
-func TestControllerUpdatingSecretShouldUpdateEnvInStatefulSet(t *testing.T) {
-	// Creating secret
-	secretName := secretNamePrefix + "-update-" + testutil.RandSeq(5)
-	secretClient, err := testutil.CreateSecret(clients.KubernetesClient, namespace, secretName, data)
-	if err != nil {
-		t.Errorf("Error  in secret creation: %v", err)
-	}
-
-	// Creating StatefulSet
-	_, err = testutil.CreateStatefulSet(clients.KubernetesClient, secretName, namespace, true)
-	if err != nil {
-		t.Errorf("Error  in StatefulSet creation: %v", err)
-	}
-
-	// Updating Secret
-	err = testutil.UpdateSecret(secretClient, namespace, secretName, "", newData)
-	if err != nil {
-		t.Errorf("Error while updating secret %v", err)
-	}
-
-	// Updating Secret
-	err = testutil.UpdateSecret(secretClient, namespace, secretName, "", updatedData)
-	if err != nil {
-		t.Errorf("Error while updating secret %v", err)
-	}
-
-	// Verifying Upgrade
-	logrus.Infof("Verifying env var has been updated")
-	shaData := testutil.ConvertResourceToSHA(testutil.SecretResourceType, namespace, secretName, updatedData)
-	config := util.Config{
-		Namespace:    namespace,
-		ResourceName: secretName,
-		SHAValue:     shaData,
-		Annotation:   options.SecretUpdateOnChangeAnnotation,
-	}
-	statefulSetFuncs := handler.GetStatefulSetRollingUpgradeFuncs()
-	updated := testutil.VerifyResourceUpdate(clients, config, constants.SecretEnvVarPostfix, statefulSetFuncs)
-	if !updated {
-		t.Errorf("StatefulSet was not updated")
-	}
-
-	// Deleting StatefulSet
-	err = testutil.DeleteStatefulSet(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the StatefulSet %v", err)
-	}
-
-	//Deleting Secret
-	err = testutil.DeleteSecret(clients.KubernetesClient, namespace, secretName)
-	if err != nil {
-		logrus.Errorf("Error while deleting the secret %v", err)
-	}
-	time.Sleep(sleepDuration)
-}
-
-func TestController_resourceInIgnoredNamespace(t *testing.T) {
-	type fields struct {
-		client            kubernetes.Interface
-		indexer           cache.Indexer
-		queue             workqueue.RateLimitingInterface
-		informer          cache.Controller
-		namespace         string
-		ignoredNamespaces util.List
-	}
-	type args struct {
-		raw interface{}
-	}
+func TestResourceInIgnoredNamespace(t *testing.T) {
 	tests := []struct {
-		name   string
-		fields fields
-		args   args
-		want   bool
+		name              string
+		ignoredNamespaces []string
+		resource          interface{}
+		expected          bool
 	}{
 		{
-			name: "TestConfigMapResourceInIgnoredNamespaceShouldReturnTrue",
-			fields: fields{
-				ignoredNamespaces: util.List{
-					"system",
+			name:              "ConfigMap in ignored namespace",
+			ignoredNamespaces: []string{"kube-system", "default"},
+			resource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "kube-system",
 				},
 			},
-			args: args{
-				raw: testutil.GetConfigmap("system", "testcm", "test"),
-			},
-			want: true,
+			expected: true,
 		},
 		{
-			name: "TestSecretResourceInIgnoredNamespaceShouldReturnTrue",
-			fields: fields{
-				ignoredNamespaces: util.List{
-					"system",
+			name:              "ConfigMap not in ignored namespace",
+			ignoredNamespaces: []string{"kube-system", "default"},
+			resource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "my-namespace",
 				},
 			},
-			args: args{
-				raw: testutil.GetSecret("system", "testsecret", "test"),
-			},
-			want: true,
+			expected: false,
 		},
 		{
-			name: "TestConfigMapResourceInIgnoredNamespaceShouldReturnFalse",
-			fields: fields{
-				ignoredNamespaces: util.List{
-					"system",
+			name:              "Secret in ignored namespace",
+			ignoredNamespaces: []string{"kube-system"},
+			resource: &v1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-secret",
+					Namespace: "kube-system",
 				},
 			},
-			args: args{
-				raw: testutil.GetConfigmap("some-other-namespace", "testcm", "test"),
-			},
-			want: false,
+			expected: true,
 		},
 		{
-			name: "TestConfigMapResourceInIgnoredNamespaceShouldReturnFalse",
-			fields: fields{
-				ignoredNamespaces: util.List{
-					"system",
+			name:              "Secret not in ignored namespace",
+			ignoredNamespaces: []string{"kube-system"},
+			resource: &v1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-secret",
+					Namespace: "my-namespace",
 				},
 			},
-			args: args{
-				raw: testutil.GetSecret("some-other-namespace", "testsecret", "test"),
+			expected: false,
+		},
+		{
+			name:              "Empty ignored namespaces list",
+			ignoredNamespaces: []string{},
+			resource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "any-namespace",
+				},
 			},
-			want: false,
+			expected: false,
+		},
+		{
+			name:              "Unknown resource type",
+			ignoredNamespaces: []string{"kube-system"},
+			resource:          &v1.Pod{}, // Not a ConfigMap or Secret
+			expected:          false,
 		},
 	}
+
+	for _, tt := range tests {
+		t.Run(
+			tt.name, func(t *testing.T) {
+				c := newTestController(tt.ignoredNamespaces, "")
+				result := c.resourceInIgnoredNamespace(tt.resource)
+				assert.Equal(t, tt.expected, result)
+			},
+		)
+	}
+}
+
+func TestResourceInSelectedNamespaces(t *testing.T) {
+	tests := []struct {
+		name              string
+		namespaceSelector string
+		cachedNamespaces  []string
+		resource          interface{}
+		expected          bool
+	}{
+		{
+			name:              "No namespace selector - all namespaces allowed",
+			namespaceSelector: "",
+			cachedNamespaces:  []string{},
+			resource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "any-namespace",
+				},
+			},
+			expected: true,
+		},
+		{
+			name:              "ConfigMap in selected namespace",
+			namespaceSelector: "env=prod",
+			cachedNamespaces:  []string{"prod-ns", "staging-ns"},
+			resource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "prod-ns",
+				},
+			},
+			expected: true,
+		},
+		{
+			name:              "ConfigMap not in selected namespace",
+			namespaceSelector: "env=prod",
+			cachedNamespaces:  []string{"prod-ns"},
+			resource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "dev-ns",
+				},
+			},
+			expected: false,
+		},
+		{
+			name:              "Secret in selected namespace",
+			namespaceSelector: "env=prod",
+			cachedNamespaces:  []string{"prod-ns"},
+			resource: &v1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-secret",
+					Namespace: "prod-ns",
+				},
+			},
+			expected: true,
+		},
+		{
+			name:              "Secret not in selected namespace",
+			namespaceSelector: "env=prod",
+			cachedNamespaces:  []string{"prod-ns"},
+			resource: &v1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-secret",
+					Namespace: "dev-ns",
+				},
+			},
+			expected: false,
+		},
+		{
+			name:              "Unknown resource type with selector",
+			namespaceSelector: "env=prod",
+			cachedNamespaces:  []string{"prod-ns"},
+			resource:          &v1.Pod{},
+			expected:          false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(
+			tt.name, func(t *testing.T) {
+				resetGlobalState()
+				storeSelectedNamespaces(tt.cachedNamespaces)
+
+				c := newTestController([]string{}, tt.namespaceSelector)
+				result := c.resourceInSelectedNamespaces(tt.resource)
+				assert.Equal(t, tt.expected, result)
+			},
+		)
+	}
+}
+
+func TestAddSelectedNamespaceToCache(t *testing.T) {
+	resetGlobalState()
+
+	c := newTestController([]string{}, "env=prod")
+
+	// Add first namespace
+	ns1 := v1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: "namespace-1"},
+	}
+	c.addSelectedNamespaceToCache(ns1)
+	assert.Contains(t, loadSelectedNamespaces(), "namespace-1")
+	assert.Len(t, loadSelectedNamespaces(), 1)
+
+	// Add second namespace
+	ns2 := v1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: "namespace-2"},
+	}
+	c.addSelectedNamespaceToCache(ns2)
+	assert.Contains(t, loadSelectedNamespaces(), "namespace-1")
+	assert.Contains(t, loadSelectedNamespaces(), "namespace-2")
+	assert.Len(t, loadSelectedNamespaces(), 2)
+}
+
+func TestRemoveSelectedNamespaceFromCache(t *testing.T) {
+	tests := []struct {
+		name              string
+		initialCache      []string
+		namespaceToRemove string
+		expectedCache     []string
+	}{
+		{
+			name:              "Remove existing namespace",
+			initialCache:      []string{"ns-1", "ns-2", "ns-3"},
+			namespaceToRemove: "ns-2",
+			expectedCache:     []string{"ns-1", "ns-3"},
+		},
+		{
+			name:              "Remove non-existing namespace",
+			initialCache:      []string{"ns-1", "ns-2"},
+			namespaceToRemove: "ns-3",
+			expectedCache:     []string{"ns-1", "ns-2"},
+		},
+		{
+			name:              "Remove from empty cache",
+			initialCache:      []string{},
+			namespaceToRemove: "ns-1",
+			expectedCache:     []string{},
+		},
+		{
+			name:              "Remove only namespace",
+			initialCache:      []string{"ns-1"},
+			namespaceToRemove: "ns-1",
+			expectedCache:     []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(
+			tt.name, func(t *testing.T) {
+				resetGlobalState()
+				storeSelectedNamespaces(tt.initialCache)
+
+				c := newTestController([]string{}, "env=prod")
+				ns := v1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{Name: tt.namespaceToRemove},
+				}
+				c.removeSelectedNamespaceFromCache(ns)
+
+				assert.ElementsMatch(t, tt.expectedCache, loadSelectedNamespacesList())
+			},
+		)
+	}
+}
+
+func TestAddHandler(t *testing.T) {
+	tests := []struct {
+		name              string
+		reloadOnCreate    string
+		ignoredNamespaces []string
+		resource          interface{}
+		controllersInit   bool
+		expectQueueItem   bool
+	}{
+		{
+			name:              "Namespace resource - should not queue",
+			reloadOnCreate:    "true",
+			ignoredNamespaces: []string{},
+			resource: &v1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-ns"},
+			},
+			controllersInit: true,
+			expectQueueItem: false,
+		},
+		{
+			name:              "ReloadOnCreate disabled",
+			reloadOnCreate:    "false",
+			ignoredNamespaces: []string{},
+			resource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "default",
+				},
+			},
+			controllersInit: true,
+			expectQueueItem: false,
+		},
+		{
+			name:              "ConfigMap in ignored namespace",
+			reloadOnCreate:    "true",
+			ignoredNamespaces: []string{"kube-system"},
+			resource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "kube-system",
+				},
+			},
+			controllersInit: true,
+			expectQueueItem: false,
+		},
+		{
+			name:              "Controllers not initialized",
+			reloadOnCreate:    "true",
+			ignoredNamespaces: []string{},
+			resource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "default",
+				},
+			},
+			controllersInit: false,
+			expectQueueItem: false,
+		},
+		{
+			name:              "Valid ConfigMap - should queue",
+			reloadOnCreate:    "true",
+			ignoredNamespaces: []string{},
+			resource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "default",
+				},
+			},
+			controllersInit: true,
+			expectQueueItem: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(
+			tt.name, func(t *testing.T) {
+				resetGlobalState()
+				options.ReloadOnCreate = tt.reloadOnCreate
+				secretControllerInitialized.Store(tt.controllersInit)
+				configmapControllerInitialized.Store(tt.controllersInit)
+
+				c := newTestController(tt.ignoredNamespaces, "")
+				c.Add(tt.resource)
+
+				if tt.expectQueueItem {
+					assert.Equal(t, 1, c.queue.Len(), "Expected queue to have 1 item")
+				} else {
+					assert.Equal(t, 0, c.queue.Len(), "Expected queue to be empty")
+				}
+			},
+		)
+	}
+}
+
+func TestUpdateHandler(t *testing.T) {
+	tests := []struct {
+		name              string
+		ignoredNamespaces []string
+		namespaceSelector string
+		cachedNamespaces  []string
+		oldResource       interface{}
+		newResource       interface{}
+		expectQueueItem   bool
+	}{
+		{
+			name:              "Namespace resource - should not queue",
+			ignoredNamespaces: []string{},
+			oldResource: &v1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-ns"},
+			},
+			newResource: &v1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-ns"},
+			},
+			expectQueueItem: false,
+		},
+		{
+			name:              "ConfigMap in ignored namespace",
+			ignoredNamespaces: []string{"kube-system"},
+			oldResource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "kube-system",
+				},
+			},
+			newResource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "kube-system",
+				},
+			},
+			expectQueueItem: false,
+		},
+		{
+			name:              "ConfigMap not in selected namespace",
+			ignoredNamespaces: []string{},
+			namespaceSelector: "env=prod",
+			cachedNamespaces:  []string{"prod-ns"},
+			oldResource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "dev-ns",
+				},
+			},
+			newResource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "dev-ns",
+				},
+			},
+			expectQueueItem: false,
+		},
+		{
+			name:              "Valid ConfigMap update - should queue",
+			ignoredNamespaces: []string{},
+			oldResource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "default",
+				},
+				Data: map[string]string{"key": "old-value"},
+			},
+			newResource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "default",
+				},
+				Data: map[string]string{"key": "new-value"},
+			},
+			expectQueueItem: true,
+		},
+		{
+			name:              "Valid Secret update - should queue",
+			ignoredNamespaces: []string{},
+			oldResource: &v1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-secret",
+					Namespace: "default",
+				},
+			},
+			newResource: &v1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-secret",
+					Namespace: "default",
+				},
+			},
+			expectQueueItem: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(
+			tt.name, func(t *testing.T) {
+				resetGlobalState()
+				if tt.cachedNamespaces != nil {
+					storeSelectedNamespaces(tt.cachedNamespaces)
+				}
+
+				c := newTestController(tt.ignoredNamespaces, tt.namespaceSelector)
+				c.Update(tt.oldResource, tt.newResource)
+
+				if tt.expectQueueItem {
+					assert.Equal(t, 1, c.queue.Len(), "Expected queue to have 1 item")
+					// Verify the queued item is the correct type
+					item, _ := c.queue.Get()
+					_, ok := item.(handler.ResourceUpdatedHandler)
+					assert.True(t, ok, "Expected ResourceUpdatedHandler in queue")
+					c.queue.Done(item)
+				} else {
+					assert.Equal(t, 0, c.queue.Len(), "Expected queue to be empty")
+				}
+			},
+		)
+	}
+}
+
+func TestDeleteHandler(t *testing.T) {
+	tests := []struct {
+		name              string
+		reloadOnDelete    string
+		ignoredNamespaces []string
+		resource          interface{}
+		controllersInit   bool
+		expectQueueItem   bool
+	}{
+		{
+			name:              "ReloadOnDelete disabled",
+			reloadOnDelete:    "false",
+			ignoredNamespaces: []string{},
+			resource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "default",
+				},
+			},
+			controllersInit: true,
+			expectQueueItem: false,
+		},
+		{
+			name:              "ConfigMap in ignored namespace",
+			reloadOnDelete:    "true",
+			ignoredNamespaces: []string{"kube-system"},
+			resource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "kube-system",
+				},
+			},
+			controllersInit: true,
+			expectQueueItem: false,
+		},
+		{
+			name:              "Controllers not initialized",
+			reloadOnDelete:    "true",
+			ignoredNamespaces: []string{},
+			resource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "default",
+				},
+			},
+			controllersInit: false,
+			expectQueueItem: false,
+		},
+		{
+			name:              "Valid ConfigMap delete - should queue",
+			reloadOnDelete:    "true",
+			ignoredNamespaces: []string{},
+			resource: &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "default",
+				},
+			},
+			controllersInit: true,
+			expectQueueItem: true,
+		},
+		{
+			name:              "Namespace delete - updates cache",
+			reloadOnDelete:    "false", // Disable to test cache update only
+			ignoredNamespaces: []string{},
+			resource: &v1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-ns"},
+			},
+			controllersInit: true,
+			expectQueueItem: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(
+			tt.name, func(t *testing.T) {
+				resetGlobalState()
+				options.ReloadOnDelete = tt.reloadOnDelete
+				secretControllerInitialized.Store(tt.controllersInit)
+				configmapControllerInitialized.Store(tt.controllersInit)
+
+				c := newTestController(tt.ignoredNamespaces, "")
+				c.Delete(tt.resource)
+
+				if tt.expectQueueItem {
+					assert.Equal(t, 1, c.queue.Len(), "Expected queue to have 1 item")
+					// Verify the queued item is the correct type
+					item, _ := c.queue.Get()
+					_, ok := item.(handler.ResourceDeleteHandler)
+					assert.True(t, ok, "Expected ResourceDeleteHandler in queue")
+					c.queue.Done(item)
+				} else {
+					assert.Equal(t, 0, c.queue.Len(), "Expected queue to be empty")
+				}
+			},
+		)
+	}
+}
+
+func TestDeleteHandlerWithTombstone(t *testing.T) {
+	t.Run(
+		"ConfigMap tombstone - should queue the ConfigMap", func(t *testing.T) {
+			resetGlobalState()
+			options.ReloadOnDelete = "true"
+			secretControllerInitialized.Store(true)
+			configmapControllerInitialized.Store(true)
+
+			cm := &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "default",
+				},
+			}
+
+			c := newTestController([]string{}, "")
+			c.Delete(cache.DeletedFinalStateUnknown{Key: "default/test-cm", Obj: cm})
+
+			assert.Equal(t, 1, c.queue.Len(), "Expected queue to have 1 item")
+			item, _ := c.queue.Get()
+			deleteHandler, ok := item.(handler.ResourceDeleteHandler)
+			assert.True(t, ok, "Expected ResourceDeleteHandler in queue")
+			assert.Equal(t, cm, deleteHandler.Resource, "Expected the ConfigMap from the tombstone")
+			c.queue.Done(item)
+		},
+	)
+
+	t.Run(
+		"ConfigMap tombstone in ignored namespace - should not queue", func(t *testing.T) {
+			resetGlobalState()
+			options.ReloadOnDelete = "true"
+			secretControllerInitialized.Store(true)
+			configmapControllerInitialized.Store(true)
+
+			cm := &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cm",
+					Namespace: "kube-system",
+				},
+			}
+
+			c := newTestController([]string{"kube-system"}, "")
+			c.Delete(cache.DeletedFinalStateUnknown{Key: "kube-system/test-cm", Obj: cm})
+
+			assert.Equal(t, 0, c.queue.Len(), "Expected queue to be empty")
+		},
+	)
+
+	t.Run(
+		"Namespace tombstone - should remove namespace from cache", func(t *testing.T) {
+			resetGlobalState()
+			storeSelectedNamespaces([]string{"ns-1", "ns-to-delete"})
+
+			ns := &v1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "ns-to-delete"},
+			}
+
+			c := newTestController([]string{}, "env=prod")
+			c.Delete(cache.DeletedFinalStateUnknown{Key: "ns-to-delete", Obj: ns})
+
+			assert.NotContains(t, loadSelectedNamespaces(), "ns-to-delete")
+			assert.Contains(t, loadSelectedNamespaces(), "ns-1")
+		},
+	)
+}
+
+func TestHandleErr(t *testing.T) {
+	t.Run(
+		"No error - should forget key", func(t *testing.T) {
+			resetGlobalState()
+			c := newTestController([]string{}, "")
+
+			key := "test-key"
+			// Add key to queue first
+			c.queue.Add(key)
+			item, _ := c.queue.Get()
+
+			// Handle with no error
+			c.handleErr(nil, item)
+			c.queue.Done(item)
+
+			// Key should be forgotten (NumRequeues should be 0)
+			assert.Equal(t, 0, c.queue.NumRequeues(key))
+		},
+	)
+
+	t.Run(
+		"Error at max retries - should drop key", func(t *testing.T) {
+			resetGlobalState()
+			c := newTestController([]string{}, "")
+
+			key := "test-key-max"
+
+			// Simulate 5 previous failures (max retries)
+			for range 5 {
+				c.queue.AddRateLimited(key)
+			}
+
+			// After max retries, handleErr should forget the key
+			c.handleErr(assert.AnError, key)
+
+			// Key should be forgotten
+			assert.Equal(t, 0, c.queue.NumRequeues(key))
+		},
+	)
+}
+
+func TestAddHandlerWithNamespaceEvent(t *testing.T) {
+	resetGlobalState()
+
+	c := newTestController([]string{}, "env=prod")
+
+	// When a namespace is added, it should be cached
+	ns := &v1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: "new-namespace"},
+	}
+
+	c.Add(ns)
+
+	assert.Contains(t, loadSelectedNamespaces(), "new-namespace")
+	assert.Equal(t, 0, c.queue.Len(), "Namespace add should not queue anything")
+}
+
+func TestDeleteHandlerWithNamespaceEvent(t *testing.T) {
+	resetGlobalState()
+	storeSelectedNamespaces([]string{"ns-1", "ns-to-delete", "ns-2"})
+
+	c := newTestController([]string{}, "env=prod")
+	options.ReloadOnDelete = "true"
+	secretControllerInitialized.Store(true)
+	configmapControllerInitialized.Store(true)
+
+	ns := &v1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: "ns-to-delete"},
+	}
+
+	c.Delete(ns)
+
+	assert.NotContains(t, loadSelectedNamespaces(), "ns-to-delete")
+	assert.Contains(t, loadSelectedNamespaces(), "ns-1")
+	assert.Contains(t, loadSelectedNamespaces(), "ns-2")
+	assert.Equal(t, 0, c.queue.Len(), "Namespace delete should not queue anything")
+}
+
+func TestProcessNextItem(t *testing.T) {
+	tests := []struct {
+		name           string
+		handler        *mockResourceHandler
+		expectContinue bool
+		expectCalls    int
+	}{
+		{
+			name: "Successful handler execution",
+			handler: &mockResourceHandler{
+				handleErr:   nil,
+				enqueueTime: time.Now().Add(-10 * time.Millisecond),
+			},
+			expectContinue: true,
+			expectCalls:    1,
+		},
+		{
+			name: "Handler returns error",
+			handler: &mockResourceHandler{
+				handleErr:   errors.New("test error"),
+				enqueueTime: time.Now().Add(-10 * time.Millisecond),
+			},
+			expectContinue: true,
+			expectCalls:    1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(
+			tt.name, func(t *testing.T) {
+				resetGlobalState()
+				c := newTestController([]string{}, "")
+
+				c.queue.Add(tt.handler)
+
+				result := c.processNextItem()
+
+				assert.Equal(t, tt.expectContinue, result)
+				assert.Equal(t, tt.expectCalls, tt.handler.handleCalls)
+			},
+		)
+	}
+}
+
+func TestProcessNextItemRecordsHandlerErrorsOnce(t *testing.T) {
+	tests := []struct {
+		name          string
+		handleErr     error
+		wantErrorType string
+		wantResult    string
+		wantRetries   float64
+		wantRequeues  int
+	}{
+		{
+			name:          "retryable error is requeued",
+			handleErr:     errors.New("webhook returned status 503 Service Unavailable"),
+			wantErrorType: "handler_error",
+			wantRetries:   1,
+			wantRequeues:  1,
+		},
+		{
+			name:          "non-retryable error is dropped",
+			handleErr:     fmt.Errorf("%w: webhook returned status 401 Unauthorized", handler.ErrNotRetryable),
+			wantErrorType: "webhook_non_retryable",
+			wantResult:    "dropped",
+		},
+	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := &Controller{
-				client:            tt.fields.client,
-				indexer:           tt.fields.indexer,
-				queue:             tt.fields.queue,
-				informer:          tt.fields.informer,
-				namespace:         tt.fields.namespace,
-				ignoredNamespaces: tt.fields.ignoredNamespaces,
+			resetGlobalState()
+			c := newTestController([]string{}, "")
+			h := &mockResourceHandler{handleErr: tt.handleErr, enqueueTime: time.Now()}
+			c.queue.Add(h)
+
+			assert.True(t, c.processNextItem())
+
+			for _, errorType := range []string{"handler_error", "webhook_non_retryable"} {
+				want := 0.0
+				if errorType == tt.wantErrorType {
+					want = 1
+				}
+				assert.Equal(t, want, counterValue(t, c.collectors.ErrorsTotal.WithLabelValues(errorType)), errorType)
 			}
-			if got := c.resourceInIgnoredNamespace(tt.args.raw); got != tt.want {
-				t.Errorf("Controller.resourceInIgnoredNamespace() = %v, want %v", got, tt.want)
+			for _, result := range []string{"success", "dropped"} {
+				want := 0.0
+				if result == tt.wantResult {
+					want = 1
+				}
+				assert.Equal(t, want, counterValue(t, c.collectors.EventsProcessed.WithLabelValues("unknown", "configmaps", result)), result)
+			}
+			assert.Equal(t, 1.0, counterValue(t, c.collectors.ReconcileTotal.WithLabelValues("error")))
+			assert.Equal(t, 0.0, counterValue(t, c.collectors.ReconcileTotal.WithLabelValues("success")))
+			assert.Equal(t, tt.wantRetries, counterValue(t, c.collectors.RetriesTotal))
+			assert.Equal(t, tt.wantRequeues, c.queue.NumRequeues(h))
+		})
+	}
+}
+
+func counterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(c)
+	families, err := registry.Gather()
+	assert.NoError(t, err)
+	if len(families) == 0 {
+		return 0
+	}
+	return families[0].GetMetric()[0].GetCounter().GetValue()
+}
+
+func TestProcessNextItemQueueShutdown(t *testing.T) {
+	resetGlobalState()
+	c := newTestController([]string{}, "")
+
+	c.queue.ShutDown()
+
+	result := c.processNextItem()
+	assert.False(t, result, "Should return false when queue is shutdown")
+}
+
+func TestMarkIgnoredResourcesInitialized(t *testing.T) {
+	tests := []struct {
+		name              string
+		resourcesToIgnore []string
+		wantSecrets       bool
+		wantConfigmaps    bool
+	}{
+		{name: "nothing ignored", resourcesToIgnore: nil, wantSecrets: false, wantConfigmaps: false},
+		{name: "configmaps ignored", resourcesToIgnore: []string{"configMaps"}, wantSecrets: false, wantConfigmaps: true},
+		{name: "secrets ignored", resourcesToIgnore: []string{"secrets"}, wantSecrets: true, wantConfigmaps: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetGlobalState()
+			original := options.ResourcesToIgnore
+			options.ResourcesToIgnore = tt.resourcesToIgnore
+			defer func() { options.ResourcesToIgnore = original }()
+
+			markIgnoredResourcesInitialized()
+
+			assert.Equal(t, tt.wantSecrets, secretControllerInitialized.Load())
+			assert.Equal(t, tt.wantConfigmaps, configmapControllerInitialized.Load())
+		})
+	}
+}
+
+func TestHandlersWithIgnoredResource(t *testing.T) {
+	secret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-secret",
+			Namespace: "default",
+		},
+	}
+
+	tests := []struct {
+		name            string
+		secretInit      bool
+		expectQueueItem bool
+	}{
+		{
+			name:            "Initial list before secret controller started - should not queue",
+			secretInit:      false,
+			expectQueueItem: false,
+		},
+		{
+			name:            "Secret controller started - should queue",
+			secretInit:      true,
+			expectQueueItem: true,
+		},
+	}
+
+	originalIgnore := options.ResourcesToIgnore
+	originalCreate := options.ReloadOnCreate
+	originalDelete := options.ReloadOnDelete
+	originalSync := options.SyncAfterRestart
+	defer func() {
+		options.ResourcesToIgnore = originalIgnore
+		options.ReloadOnCreate = originalCreate
+		options.ReloadOnDelete = originalDelete
+		options.SyncAfterRestart = originalSync
+	}()
+
+	options.ResourcesToIgnore = []string{"configmaps"}
+	options.ReloadOnCreate = "true"
+	options.ReloadOnDelete = "true"
+	options.SyncAfterRestart = false
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, handle := range []func(*Controller){
+				func(c *Controller) { c.Add(secret) },
+				func(c *Controller) { c.Delete(secret) },
+			} {
+				resetGlobalState()
+				markIgnoredResourcesInitialized()
+				// Simulate runWorker of the secret controller.
+				secretControllerInitialized.Store(tt.secretInit)
+
+				c := newTestController([]string{}, "")
+				handle(c)
+
+				if tt.expectQueueItem {
+					assert.Equal(t, 1, c.queue.Len(), "Expected queue to have 1 item")
+				} else {
+					assert.Equal(t, 0, c.queue.Len(), "Expected queue to be empty")
+				}
 			}
 		})
 	}

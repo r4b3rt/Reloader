@@ -1,26 +1,39 @@
 package testutil
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"math/rand"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	argorolloutv1alpha1 "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
+	argorollout "github.com/argoproj/argo-rollouts/pkg/client/clientset/versioned"
 	openshiftv1 "github.com/openshift/api/apps/v1"
 	appsclient "github.com/openshift/client-go/apps/clientset/versioned"
 	"github.com/sirupsen/logrus"
-	"github.com/stakater/Reloader/internal/pkg/callbacks"
-	"github.com/stakater/Reloader/internal/pkg/constants"
-	"github.com/stakater/Reloader/internal/pkg/crypto"
-	"github.com/stakater/Reloader/internal/pkg/options"
-	"github.com/stakater/Reloader/internal/pkg/util"
-	"github.com/stakater/Reloader/pkg/kube"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	core_v1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	csiv1 "sigs.k8s.io/secrets-store-csi-driver/apis/v1"
+	csiclient "sigs.k8s.io/secrets-store-csi-driver/pkg/client/clientset/versioned"
+	csiclient_v1 "sigs.k8s.io/secrets-store-csi-driver/pkg/client/clientset/versioned/typed/apis/v1"
+
+	"github.com/stakater/Reloader/internal/pkg/callbacks"
+	"github.com/stakater/Reloader/internal/pkg/constants"
+	"github.com/stakater/Reloader/internal/pkg/crypto"
+	"github.com/stakater/Reloader/internal/pkg/metrics"
+	"github.com/stakater/Reloader/internal/pkg/options"
+	"github.com/stakater/Reloader/internal/pkg/util"
+	"github.com/stakater/Reloader/pkg/common"
+	"github.com/stakater/Reloader/pkg/kube"
 )
 
 var (
@@ -29,11 +42,26 @@ var (
 	ConfigmapResourceType = "configMaps"
 	// SecretResourceType is a resource type which controller watches for changes
 	SecretResourceType = "secrets"
+	// SecretproviderclasspodstatusResourceType is a resource type which controller watches for changes
+	SecretProviderClassPodStatusResourceType = "secretproviderclasspodstatuses"
+)
+
+var (
+	Clients             = kube.GetClients()
+	Pod                 = "test-reloader-" + RandSeq(5)
+	Namespace           = "test-reloader-" + RandSeq(5)
+	ConfigmapNamePrefix = "testconfigmap-reloader"
+	SecretNamePrefix    = "testsecret-reloader"
+	Data                = "dGVzdFNlY3JldEVuY29kaW5nRm9yUmVsb2FkZXI="
+	NewData             = "dGVzdE5ld1NlY3JldEVuY29kaW5nRm9yUmVsb2FkZXI="
+	UpdatedData         = "dGVzdFVwZGF0ZWRTZWNyZXRFbmNvZGluZ0ZvclJlbG9hZGVy"
+	Collectors          = metrics.NewCollectors()
+	SleepDuration       = 3 * time.Second
 )
 
 // CreateNamespace creates namespace for testing
 func CreateNamespace(namespace string, client kubernetes.Interface) {
-	_, err := client.CoreV1().Namespaces().Create(&v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})
+	_, err := client.CoreV1().Namespaces().Create(context.TODO(), &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}, metav1.CreateOptions{})
 	if err != nil {
 		logrus.Fatalf("Failed to create namespace for testing %v", err)
 	} else {
@@ -43,7 +71,7 @@ func CreateNamespace(namespace string, client kubernetes.Interface) {
 
 // DeleteNamespace deletes namespace for testing
 func DeleteNamespace(namespace string, client kubernetes.Interface) {
-	err := client.CoreV1().Namespaces().Delete(namespace, &metav1.DeleteOptions{})
+	err := client.CoreV1().Namespaces().Delete(context.TODO(), namespace, metav1.DeleteOptions{})
 	if err != nil {
 		logrus.Fatalf("Failed to delete namespace that was created for testing %v", err)
 	} else {
@@ -51,24 +79,41 @@ func DeleteNamespace(namespace string, client kubernetes.Interface) {
 	}
 }
 
-func getObjectMeta(namespace string, name string, autoReload bool) metav1.ObjectMeta {
+func getObjectMeta(namespace string, name string, autoReload bool, secretAutoReload bool, configmapAutoReload bool, secretproviderclass bool, extraAnnotations map[string]string) metav1.ObjectMeta {
 	return metav1.ObjectMeta{
 		Name:        name,
 		Namespace:   namespace,
 		Labels:      map[string]string{"firstLabel": "temp"},
-		Annotations: getAnnotations(name, autoReload),
+		Annotations: getAnnotations(name, autoReload, secretAutoReload, configmapAutoReload, secretproviderclass, extraAnnotations),
 	}
 }
 
-func getAnnotations(name string, autoReload bool) map[string]string {
+func getAnnotations(name string, autoReload bool, secretAutoReload bool, configmapAutoReload bool, secretproviderclass bool, extraAnnotations map[string]string) map[string]string {
+	annotations := make(map[string]string)
 	if autoReload {
-		return map[string]string{
-			options.ReloaderAutoAnnotation: "true"}
+		annotations[options.ReloaderAutoAnnotation] = "true"
+	}
+	if secretAutoReload {
+		annotations[options.SecretReloaderAutoAnnotation] = "true"
+	}
+	if configmapAutoReload {
+		annotations[options.ConfigmapReloaderAutoAnnotation] = "true"
+	}
+	if secretproviderclass {
+		annotations[options.SecretProviderClassReloaderAutoAnnotation] = "true"
 	}
 
-	return map[string]string{
-		options.ConfigmapUpdateOnChangeAnnotation: name,
-		options.SecretUpdateOnChangeAnnotation:    name}
+	if len(annotations) == 0 {
+		annotations = map[string]string{
+			options.ConfigmapUpdateOnChangeAnnotation:           name,
+			options.SecretUpdateOnChangeAnnotation:              name,
+			options.SecretProviderClassUpdateOnChangeAnnotation: name,
+		}
+	}
+	for k, v := range extraAnnotations {
+		annotations[k] = v
+	}
+	return annotations
 }
 
 func getEnvVarSources(name string) []v1.EnvFromSource {
@@ -142,10 +187,19 @@ func getVolumes(name string) []v1.Volume {
 				},
 			},
 		},
+		{
+			Name: "secretproviderclass",
+			VolumeSource: v1.VolumeSource{
+				CSI: &v1.CSIVolumeSource{
+					Driver:           "secrets-store.csi.k8s.io",
+					VolumeAttributes: map[string]string{"secretProviderClass": name},
+				},
+			},
+		},
 	}
 }
 
-func getVolumeMounts(name string) []v1.VolumeMount {
+func getVolumeMounts() []v1.VolumeMount {
 	return []v1.VolumeMount{
 		{
 			MountPath: "etc/config",
@@ -154,6 +208,10 @@ func getVolumeMounts(name string) []v1.VolumeMount {
 		{
 			MountPath: "etc/sec",
 			Name:      "secret",
+		},
+		{
+			MountPath: "etc/spc",
+			Name:      "secretproviderclass",
 		},
 		{
 			MountPath: "etc/projectedconfig",
@@ -243,7 +301,7 @@ func getPodTemplateSpecWithVolumes(name string) v1.PodTemplateSpec {
 							Value: "test",
 						},
 					},
-					VolumeMounts: getVolumeMounts(name),
+					VolumeMounts: getVolumeMounts(),
 				},
 			},
 			Volumes: getVolumes(name),
@@ -261,7 +319,7 @@ func getPodTemplateSpecWithInitContainer(name string) v1.PodTemplateSpec {
 				{
 					Image:        "busybox",
 					Name:         "busyBox",
-					VolumeMounts: getVolumeMounts(name),
+					VolumeMounts: getVolumeMounts(),
 				},
 			},
 			Containers: []v1.Container{
@@ -314,7 +372,7 @@ func getPodTemplateSpecWithInitContainerAndEnv(name string) v1.PodTemplateSpec {
 func GetDeployment(namespace string, deploymentName string) *appsv1.Deployment {
 	replicaset := int32(1)
 	return &appsv1.Deployment{
-		ObjectMeta: getObjectMeta(namespace, deploymentName, false),
+		ObjectMeta: getObjectMeta(namespace, deploymentName, false, false, false, false, map[string]string{}),
 		Spec: appsv1.DeploymentSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"secondLabel": "temp"},
@@ -333,7 +391,7 @@ func GetDeploymentConfig(namespace string, deploymentConfigName string) *openshi
 	replicaset := int32(1)
 	podTemplateSpecWithVolume := getPodTemplateSpecWithVolumes(deploymentConfigName)
 	return &openshiftv1.DeploymentConfig{
-		ObjectMeta: getObjectMeta(namespace, deploymentConfigName, false),
+		ObjectMeta: getObjectMeta(namespace, deploymentConfigName, false, false, false, false, map[string]string{}),
 		Spec: openshiftv1.DeploymentConfigSpec{
 			Replicas: replicaset,
 			Strategy: openshiftv1.DeploymentStrategy{
@@ -348,7 +406,7 @@ func GetDeploymentConfig(namespace string, deploymentConfigName string) *openshi
 func GetDeploymentWithInitContainer(namespace string, deploymentName string) *appsv1.Deployment {
 	replicaset := int32(1)
 	return &appsv1.Deployment{
-		ObjectMeta: getObjectMeta(namespace, deploymentName, false),
+		ObjectMeta: getObjectMeta(namespace, deploymentName, false, false, false, false, map[string]string{}),
 		Spec: appsv1.DeploymentSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"secondLabel": "temp"},
@@ -366,7 +424,7 @@ func GetDeploymentWithInitContainer(namespace string, deploymentName string) *ap
 func GetDeploymentWithInitContainerAndEnv(namespace string, deploymentName string) *appsv1.Deployment {
 	replicaset := int32(1)
 	return &appsv1.Deployment{
-		ObjectMeta: getObjectMeta(namespace, deploymentName, true),
+		ObjectMeta: getObjectMeta(namespace, deploymentName, true, false, false, false, map[string]string{}),
 		Spec: appsv1.DeploymentSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"secondLabel": "temp"},
@@ -383,7 +441,7 @@ func GetDeploymentWithInitContainerAndEnv(namespace string, deploymentName strin
 func GetDeploymentWithEnvVars(namespace string, deploymentName string) *appsv1.Deployment {
 	replicaset := int32(1)
 	return &appsv1.Deployment{
-		ObjectMeta: getObjectMeta(namespace, deploymentName, true),
+		ObjectMeta: getObjectMeta(namespace, deploymentName, true, false, false, false, map[string]string{}),
 		Spec: appsv1.DeploymentSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"secondLabel": "temp"},
@@ -401,7 +459,7 @@ func GetDeploymentConfigWithEnvVars(namespace string, deploymentConfigName strin
 	replicaset := int32(1)
 	podTemplateSpecWithEnvVars := getPodTemplateSpecWithEnvVars(deploymentConfigName)
 	return &openshiftv1.DeploymentConfig{
-		ObjectMeta: getObjectMeta(namespace, deploymentConfigName, false),
+		ObjectMeta: getObjectMeta(namespace, deploymentConfigName, false, false, false, false, map[string]string{}),
 		Spec: openshiftv1.DeploymentConfigSpec{
 			Replicas: replicaset,
 			Strategy: openshiftv1.DeploymentStrategy{
@@ -415,7 +473,7 @@ func GetDeploymentConfigWithEnvVars(namespace string, deploymentConfigName strin
 func GetDeploymentWithEnvVarSources(namespace string, deploymentName string) *appsv1.Deployment {
 	replicaset := int32(1)
 	return &appsv1.Deployment{
-		ObjectMeta: getObjectMeta(namespace, deploymentName, true),
+		ObjectMeta: getObjectMeta(namespace, deploymentName, true, false, false, false, map[string]string{}),
 		Spec: appsv1.DeploymentSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"secondLabel": "temp"},
@@ -432,7 +490,7 @@ func GetDeploymentWithEnvVarSources(namespace string, deploymentName string) *ap
 func GetDeploymentWithPodAnnotations(namespace string, deploymentName string, both bool) *appsv1.Deployment {
 	replicaset := int32(1)
 	deployment := &appsv1.Deployment{
-		ObjectMeta: getObjectMeta(namespace, deploymentName, false),
+		ObjectMeta: getObjectMeta(namespace, deploymentName, false, false, false, false, map[string]string{}),
 		Spec: appsv1.DeploymentSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"secondLabel": "temp"},
@@ -445,16 +503,77 @@ func GetDeploymentWithPodAnnotations(namespace string, deploymentName string, bo
 		},
 	}
 	if !both {
-		deployment.ObjectMeta.Annotations = nil
+		deployment.Annotations = nil
 	}
-	deployment.Spec.Template.ObjectMeta.Annotations = getAnnotations(deploymentName, true)
+	deployment.Spec.Template.Annotations = getAnnotations(deploymentName, true, false, false, false, map[string]string{})
 	return deployment
+}
+
+func GetDeploymentWithTypedAutoAnnotation(namespace string, deploymentName string, resourceType string) *appsv1.Deployment {
+	replicaset := int32(1)
+	var objectMeta metav1.ObjectMeta
+	switch resourceType {
+	case SecretResourceType:
+		objectMeta = getObjectMeta(namespace, deploymentName, false, true, false, false, map[string]string{})
+	case ConfigmapResourceType:
+		objectMeta = getObjectMeta(namespace, deploymentName, false, false, true, false, map[string]string{})
+	case SecretProviderClassPodStatusResourceType:
+		objectMeta = getObjectMeta(namespace, deploymentName, false, false, false, true, map[string]string{})
+	}
+
+	return &appsv1.Deployment{
+		ObjectMeta: objectMeta,
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"secondLabel": "temp"},
+			},
+			Replicas: &replicaset,
+			Strategy: appsv1.DeploymentStrategy{
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+			},
+			Template: getPodTemplateSpecWithVolumes(deploymentName),
+		},
+	}
+}
+
+func GetDeploymentWithExcludeAnnotation(namespace string, deploymentName string, resourceType string) *appsv1.Deployment {
+	replicaset := int32(1)
+
+	annotation := map[string]string{}
+
+	switch resourceType {
+	case SecretResourceType:
+		annotation[options.SecretExcludeReloaderAnnotation] = deploymentName
+	case ConfigmapResourceType:
+		annotation[options.ConfigmapExcludeReloaderAnnotation] = deploymentName
+	case SecretProviderClassPodStatusResourceType:
+		annotation[options.SecretProviderClassExcludeReloaderAnnotation] = deploymentName
+	}
+
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        deploymentName,
+			Namespace:   namespace,
+			Labels:      map[string]string{"firstLabel": "temp"},
+			Annotations: annotation,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"secondLabel": "temp"},
+			},
+			Replicas: &replicaset,
+			Strategy: appsv1.DeploymentStrategy{
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+			},
+			Template: getPodTemplateSpecWithVolumes(deploymentName),
+		},
+	}
 }
 
 // GetDaemonSet provides daemonset for testing
 func GetDaemonSet(namespace string, daemonsetName string) *appsv1.DaemonSet {
 	return &appsv1.DaemonSet{
-		ObjectMeta: getObjectMeta(namespace, daemonsetName, false),
+		ObjectMeta: getObjectMeta(namespace, daemonsetName, false, false, false, false, map[string]string{}),
 		Spec: appsv1.DaemonSetSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"secondLabel": "temp"},
@@ -469,7 +588,7 @@ func GetDaemonSet(namespace string, daemonsetName string) *appsv1.DaemonSet {
 
 func GetDaemonSetWithEnvVars(namespace string, daemonSetName string) *appsv1.DaemonSet {
 	return &appsv1.DaemonSet{
-		ObjectMeta: getObjectMeta(namespace, daemonSetName, true),
+		ObjectMeta: getObjectMeta(namespace, daemonSetName, true, false, false, false, map[string]string{}),
 		Spec: appsv1.DaemonSetSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"secondLabel": "temp"},
@@ -485,7 +604,7 @@ func GetDaemonSetWithEnvVars(namespace string, daemonSetName string) *appsv1.Dae
 // GetStatefulSet provides statefulset for testing
 func GetStatefulSet(namespace string, statefulsetName string) *appsv1.StatefulSet {
 	return &appsv1.StatefulSet{
-		ObjectMeta: getObjectMeta(namespace, statefulsetName, false),
+		ObjectMeta: getObjectMeta(namespace, statefulsetName, false, false, false, false, map[string]string{}),
 		Spec: appsv1.StatefulSetSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"secondLabel": "temp"},
@@ -501,7 +620,7 @@ func GetStatefulSet(namespace string, statefulsetName string) *appsv1.StatefulSe
 // GetStatefulSet provides statefulset for testing
 func GetStatefulSetWithEnvVar(namespace string, statefulsetName string) *appsv1.StatefulSet {
 	return &appsv1.StatefulSet{
-		ObjectMeta: getObjectMeta(namespace, statefulsetName, true),
+		ObjectMeta: getObjectMeta(namespace, statefulsetName, true, false, false, false, map[string]string{}),
 		Spec: appsv1.StatefulSetSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"secondLabel": "temp"},
@@ -523,6 +642,42 @@ func GetConfigmap(namespace string, configmapName string, testData string) *v1.C
 			Labels:    map[string]string{"firstLabel": "temp"},
 		},
 		Data: map[string]string{"test.url": testData},
+	}
+}
+
+func GetSecretProviderClass(namespace string, secretProviderClassName string, data string) *csiv1.SecretProviderClass {
+	return &csiv1.SecretProviderClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretProviderClassName,
+			Namespace: namespace,
+		},
+		Spec: csiv1.SecretProviderClassSpec{
+			Provider: "Test",
+			Parameters: map[string]string{
+				"parameter1": data,
+			},
+		},
+	}
+}
+
+func GetSecretProviderClassPodStatus(namespace string, secretProviderClassPodStatusName string, data string) *csiv1.SecretProviderClassPodStatus {
+	return &csiv1.SecretProviderClassPodStatus{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretProviderClassPodStatusName,
+			Namespace: namespace,
+		},
+		Status: csiv1.SecretProviderClassPodStatusStatus{
+			PodName:                 "test123",
+			SecretProviderClassName: secretProviderClassPodStatusName,
+			TargetPath:              "/var/lib/kubelet/d8771ddf-935a-4199-a20b-f35f71c1d9e7/volumes/kubernetes.io~csi/secrets-store-inline/mount",
+			Mounted:                 true,
+			Objects: []csiv1.SecretProviderClassObject{
+				{
+					ID:      "parameter1",
+					Version: data,
+				},
+			},
+		},
 	}
 }
 
@@ -550,6 +705,64 @@ func GetSecret(namespace string, secretName string, data string) *v1.Secret {
 	}
 }
 
+func GetCronJob(namespace string, cronJobName string) *batchv1.CronJob {
+	return &batchv1.CronJob{
+		ObjectMeta: getObjectMeta(namespace, cronJobName, false, false, false, false, map[string]string{}),
+		Spec: batchv1.CronJobSpec{
+			Schedule: "*/5 * * * *", // Run every 5 minutes
+			JobTemplate: batchv1.JobTemplateSpec{
+				Spec: batchv1.JobSpec{
+					Selector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"secondLabel": "temp"},
+					},
+					Template: getPodTemplateSpecWithVolumes(cronJobName),
+				},
+			},
+		},
+	}
+}
+
+func GetJob(namespace string, jobName string) *batchv1.Job {
+	return &batchv1.Job{
+		ObjectMeta: getObjectMeta(namespace, jobName, false, false, false, false, map[string]string{}),
+		Spec: batchv1.JobSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"secondLabel": "temp"},
+			},
+			Template: getPodTemplateSpecWithVolumes(jobName),
+		},
+	}
+}
+
+func GetCronJobWithEnvVar(namespace string, cronJobName string) *batchv1.CronJob {
+	return &batchv1.CronJob{
+		ObjectMeta: getObjectMeta(namespace, cronJobName, true, false, false, false, map[string]string{}),
+		Spec: batchv1.CronJobSpec{
+			Schedule: "*/5 * * * *", // Run every 5 minutes
+			JobTemplate: batchv1.JobTemplateSpec{
+				Spec: batchv1.JobSpec{
+					Selector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"secondLabel": "temp"},
+					},
+					Template: getPodTemplateSpecWithEnvVars(cronJobName),
+				},
+			},
+		},
+	}
+}
+
+func GetJobWithEnvVar(namespace string, jobName string) *batchv1.Job {
+	return &batchv1.Job{
+		ObjectMeta: getObjectMeta(namespace, jobName, true, false, false, false, map[string]string{}),
+		Spec: batchv1.JobSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"secondLabel": "temp"},
+			},
+			Template: getPodTemplateSpecWithEnvVars(jobName),
+		},
+	}
+}
+
 // GetSecretWithUpdatedLabel provides secret for testing
 func GetSecretWithUpdatedLabel(namespace string, secretName string, label string, data string) *v1.Secret {
 	return &v1.Secret{
@@ -562,8 +775,8 @@ func GetSecretWithUpdatedLabel(namespace string, secretName string, label string
 	}
 }
 
-// GetResourceSHA returns the SHA value of given environment variable
-func GetResourceSHA(containers []v1.Container, envVar string) string {
+// GetResourceSHAFromEnvVar returns the SHA value of given environment variable
+func GetResourceSHAFromEnvVar(containers []v1.Container, envVar string) string {
 	for i := range containers {
 		envs := containers[i].Env
 		for j := range envs {
@@ -575,19 +788,48 @@ func GetResourceSHA(containers []v1.Container, envVar string) string {
 	return ""
 }
 
-//ConvertResourceToSHA generates SHA from secret or configmap data
+// GetResourceSHAFromAnnotation returns the SHA value of given environment variable
+func GetResourceSHAFromAnnotation(podAnnotations map[string]string) string {
+	lastReloadedResourceName := fmt.Sprintf("%s/%s",
+		constants.ReloaderAnnotationPrefix,
+		constants.LastReloadedFromAnnotation,
+	)
+
+	annotationJson, ok := podAnnotations[lastReloadedResourceName]
+	if !ok {
+		return ""
+	}
+
+	var last common.ReloadSource
+	bytes := []byte(annotationJson)
+	err := json.Unmarshal(bytes, &last)
+	if err != nil {
+		return ""
+	}
+
+	return last.Hash
+}
+
+// ConvertResourceToSHA generates SHA from secret, configmap or secretproviderclasspodstatus data
 func ConvertResourceToSHA(resourceType string, namespace string, resourceName string, data string) string {
 	values := []string{}
-	if resourceType == SecretResourceType {
+	switch resourceType {
+	case SecretResourceType:
 		secret := GetSecret(namespace, resourceName, data)
 		for k, v := range secret.Data {
 			values = append(values, k+"="+string(v[:]))
 		}
-	} else if resourceType == ConfigmapResourceType {
+	case ConfigmapResourceType:
 		configmap := GetConfigmap(namespace, resourceName, data)
 		for k, v := range configmap.Data {
 			values = append(values, k+"="+v)
 		}
+	case SecretProviderClassPodStatusResourceType:
+		secretproviderclasspodstatus := GetSecretProviderClassPodStatus(namespace, resourceName, data)
+		for _, v := range secretproviderclasspodstatus.Status.Objects {
+			values = append(values, v.ID+"="+v.Version)
+		}
+		values = append(values, "SecretProviderClassName="+secretproviderclasspodstatus.Status.SecretProviderClassName)
 	}
 	sort.Strings(values)
 	return crypto.GenerateSHA(strings.Join(values, ";"))
@@ -597,16 +839,35 @@ func ConvertResourceToSHA(resourceType string, namespace string, resourceName st
 func CreateConfigMap(client kubernetes.Interface, namespace string, configmapName string, data string) (core_v1.ConfigMapInterface, error) {
 	logrus.Infof("Creating configmap")
 	configmapClient := client.CoreV1().ConfigMaps(namespace)
-	_, err := configmapClient.Create(GetConfigmap(namespace, configmapName, data))
+	_, err := configmapClient.Create(context.TODO(), GetConfigmap(namespace, configmapName, data), metav1.CreateOptions{})
 	time.Sleep(3 * time.Second)
 	return configmapClient, err
+}
+
+// CreateSecretProviderClass creates a SecretProviderClass in given namespace and returns the SecretProviderClassInterface
+func CreateSecretProviderClass(client csiclient.Interface, namespace string, secretProviderClassName string, data string) (csiclient_v1.SecretProviderClassInterface, error) {
+	logrus.Infof("Creating SecretProviderClass")
+	secretProviderClassClient := client.SecretsstoreV1().SecretProviderClasses(namespace)
+	_, err := secretProviderClassClient.Create(context.TODO(), GetSecretProviderClass(namespace, secretProviderClassName, data), metav1.CreateOptions{})
+	time.Sleep(3 * time.Second)
+	return secretProviderClassClient, err
+}
+
+// CreateSecretProviderClassPodStatus creates a SecretProviderClassPodStatus in given namespace and returns the SecretProviderClassPodStatusInterface
+func CreateSecretProviderClassPodStatus(client csiclient.Interface, namespace string, secretProviderClassPodStatusName string, data string) (csiclient_v1.SecretProviderClassPodStatusInterface, error) {
+	logrus.Infof("Creating SecretProviderClassPodStatus")
+	secretProviderClassPodStatusClient := client.SecretsstoreV1().SecretProviderClassPodStatuses(namespace)
+	secretProviderClassPodStatus := GetSecretProviderClassPodStatus(namespace, secretProviderClassPodStatusName, data)
+	_, err := secretProviderClassPodStatusClient.Create(context.TODO(), secretProviderClassPodStatus, metav1.CreateOptions{})
+	time.Sleep(3 * time.Second)
+	return secretProviderClassPodStatusClient, err
 }
 
 // CreateSecret creates a secret in given namespace and returns the SecretInterface
 func CreateSecret(client kubernetes.Interface, namespace string, secretName string, data string) (core_v1.SecretInterface, error) {
 	logrus.Infof("Creating secret")
 	secretClient := client.CoreV1().Secrets(namespace)
-	_, err := secretClient.Create(GetSecret(namespace, secretName, data))
+	_, err := secretClient.Create(context.TODO(), GetSecret(namespace, secretName, data), metav1.CreateOptions{})
 	time.Sleep(3 * time.Second)
 	return secretClient, err
 }
@@ -621,7 +882,27 @@ func CreateDeployment(client kubernetes.Interface, deploymentName string, namesp
 	} else {
 		deploymentObj = GetDeploymentWithEnvVars(namespace, deploymentName)
 	}
-	deployment, err := deploymentClient.Create(deploymentObj)
+	deployment, err := deploymentClient.Create(context.TODO(), deploymentObj, metav1.CreateOptions{})
+	time.Sleep(3 * time.Second)
+	return deployment, err
+}
+
+// CreateDeployment creates a deployment in given namespace and returns the Deployment
+func CreateDeploymentWithAnnotations(client kubernetes.Interface, deploymentName string, namespace string, additionalAnnotations map[string]string, volumeMount bool) (*appsv1.Deployment, error) {
+	logrus.Infof("Creating Deployment")
+	deploymentClient := client.AppsV1().Deployments(namespace)
+	var deploymentObj *appsv1.Deployment
+	if volumeMount {
+		deploymentObj = GetDeployment(namespace, deploymentName)
+	} else {
+		deploymentObj = GetDeploymentWithEnvVars(namespace, deploymentName)
+	}
+
+	for annotationKey, annotationValue := range additionalAnnotations {
+		deploymentObj.Annotations[annotationKey] = annotationValue
+	}
+
+	deployment, err := deploymentClient.Create(context.TODO(), deploymentObj, metav1.CreateOptions{})
 	time.Sleep(3 * time.Second)
 	return deployment, err
 }
@@ -636,7 +917,7 @@ func CreateDeploymentConfig(client appsclient.Interface, deploymentName string, 
 	} else {
 		deploymentConfigObj = GetDeploymentConfigWithEnvVars(namespace, deploymentName)
 	}
-	deploymentConfig, err := deploymentConfigsClient.Create(deploymentConfigObj)
+	deploymentConfig, err := deploymentConfigsClient.Create(context.TODO(), deploymentConfigObj, metav1.CreateOptions{})
 	time.Sleep(5 * time.Second)
 	return deploymentConfig, err
 }
@@ -651,7 +932,7 @@ func CreateDeploymentWithInitContainer(client kubernetes.Interface, deploymentNa
 	} else {
 		deploymentObj = GetDeploymentWithInitContainerAndEnv(namespace, deploymentName)
 	}
-	deployment, err := deploymentClient.Create(deploymentObj)
+	deployment, err := deploymentClient.Create(context.TODO(), deploymentObj, metav1.CreateOptions{})
 	time.Sleep(3 * time.Second)
 	return deployment, err
 }
@@ -661,7 +942,7 @@ func CreateDeploymentWithEnvVarSource(client kubernetes.Interface, deploymentNam
 	logrus.Infof("Creating Deployment")
 	deploymentClient := client.AppsV1().Deployments(namespace)
 	deploymentObj := GetDeploymentWithEnvVarSources(namespace, deploymentName)
-	deployment, err := deploymentClient.Create(deploymentObj)
+	deployment, err := deploymentClient.Create(context.TODO(), deploymentObj, metav1.CreateOptions{})
 	time.Sleep(3 * time.Second)
 	return deployment, err
 
@@ -672,7 +953,7 @@ func CreateDeploymentWithPodAnnotations(client kubernetes.Interface, deploymentN
 	logrus.Infof("Creating Deployment")
 	deploymentClient := client.AppsV1().Deployments(namespace)
 	deploymentObj := GetDeploymentWithPodAnnotations(namespace, deploymentName, both)
-	deployment, err := deploymentClient.Create(deploymentObj)
+	deployment, err := deploymentClient.Create(context.TODO(), deploymentObj, metav1.CreateOptions{})
 	time.Sleep(3 * time.Second)
 	return deployment, err
 }
@@ -684,8 +965,27 @@ func CreateDeploymentWithEnvVarSourceAndAnnotations(client kubernetes.Interface,
 	deploymentClient := client.AppsV1().Deployments(namespace)
 	deploymentObj := GetDeploymentWithEnvVarSources(namespace, deploymentName)
 	deploymentObj.Annotations = annotations
-	deployment, err := deploymentClient.Create(deploymentObj)
+	deployment, err := deploymentClient.Create(context.TODO(), deploymentObj, metav1.CreateOptions{})
 	time.Sleep(3 * time.Second)
+	return deployment, err
+}
+
+// CreateDeploymentWithTypedAutoAnnotation creates a deployment in given namespace and returns the Deployment with typed auto annotation
+func CreateDeploymentWithTypedAutoAnnotation(client kubernetes.Interface, deploymentName string, namespace string, resourceType string) (*appsv1.Deployment, error) {
+	logrus.Infof("Creating Deployment")
+	deploymentClient := client.AppsV1().Deployments(namespace)
+	deploymentObj := GetDeploymentWithTypedAutoAnnotation(namespace, deploymentName, resourceType)
+	deployment, err := deploymentClient.Create(context.TODO(), deploymentObj, metav1.CreateOptions{})
+	time.Sleep(3 * time.Second)
+	return deployment, err
+}
+
+// CreateDeploymentWithExcludeAnnotation creates a deployment in given namespace and returns the Deployment with typed auto annotation
+func CreateDeploymentWithExcludeAnnotation(client kubernetes.Interface, deploymentName string, namespace string, resourceType string) (*appsv1.Deployment, error) {
+	logrus.Infof("Creating Deployment")
+	deploymentClient := client.AppsV1().Deployments(namespace)
+	deploymentObj := GetDeploymentWithExcludeAnnotation(namespace, deploymentName, resourceType)
+	deployment, err := deploymentClient.Create(context.TODO(), deploymentObj, metav1.CreateOptions{})
 	return deployment, err
 }
 
@@ -699,7 +999,7 @@ func CreateDaemonSet(client kubernetes.Interface, daemonsetName string, namespac
 	} else {
 		daemonsetObj = GetDaemonSetWithEnvVars(namespace, daemonsetName)
 	}
-	daemonset, err := daemonsetClient.Create(daemonsetObj)
+	daemonset, err := daemonsetClient.Create(context.TODO(), daemonsetObj, metav1.CreateOptions{})
 	time.Sleep(3 * time.Second)
 	return daemonset, err
 }
@@ -714,15 +1014,45 @@ func CreateStatefulSet(client kubernetes.Interface, statefulsetName string, name
 	} else {
 		statefulsetObj = GetStatefulSetWithEnvVar(namespace, statefulsetName)
 	}
-	statefulset, err := statefulsetClient.Create(statefulsetObj)
+	statefulset, err := statefulsetClient.Create(context.TODO(), statefulsetObj, metav1.CreateOptions{})
 	time.Sleep(3 * time.Second)
 	return statefulset, err
+}
+
+// CreateCronJob creates a cronjob in given namespace and returns the CronJob
+func CreateCronJob(client kubernetes.Interface, cronJobName string, namespace string, volumeMount bool) (*batchv1.CronJob, error) {
+	logrus.Infof("Creating CronJob")
+	cronJobClient := client.BatchV1().CronJobs(namespace)
+	var cronJobObj *batchv1.CronJob
+	if volumeMount {
+		cronJobObj = GetCronJob(namespace, cronJobName)
+	} else {
+		cronJobObj = GetCronJobWithEnvVar(namespace, cronJobName)
+	}
+	cronJob, err := cronJobClient.Create(context.TODO(), cronJobObj, metav1.CreateOptions{})
+	time.Sleep(3 * time.Second)
+	return cronJob, err
+}
+
+// CreateJob creates a job in given namespace and returns the Job
+func CreateJob(client kubernetes.Interface, jobName string, namespace string, volumeMount bool) (*batchv1.Job, error) {
+	logrus.Infof("Creating Job")
+	jobClient := client.BatchV1().Jobs(namespace)
+	var jobObj *batchv1.Job
+	if volumeMount {
+		jobObj = GetJob(namespace, jobName)
+	} else {
+		jobObj = GetJobWithEnvVar(namespace, jobName)
+	}
+	job, err := jobClient.Create(context.TODO(), jobObj, metav1.CreateOptions{})
+	time.Sleep(3 * time.Second)
+	return job, err
 }
 
 // DeleteDeployment creates a deployment in given namespace and returns the error if any
 func DeleteDeployment(client kubernetes.Interface, namespace string, deploymentName string) error {
 	logrus.Infof("Deleting Deployment")
-	deploymentError := client.AppsV1().Deployments(namespace).Delete(deploymentName, &metav1.DeleteOptions{})
+	deploymentError := client.AppsV1().Deployments(namespace).Delete(context.TODO(), deploymentName, metav1.DeleteOptions{})
 	time.Sleep(3 * time.Second)
 	return deploymentError
 }
@@ -730,7 +1060,7 @@ func DeleteDeployment(client kubernetes.Interface, namespace string, deploymentN
 // DeleteDeploymentConfig deletes a deploymentConfig in given namespace and returns the error if any
 func DeleteDeploymentConfig(client appsclient.Interface, namespace string, deploymentConfigName string) error {
 	logrus.Infof("Deleting DeploymentConfig")
-	deploymentConfigError := client.AppsV1().DeploymentConfigs(namespace).Delete(deploymentConfigName, &metav1.DeleteOptions{})
+	deploymentConfigError := client.AppsV1().DeploymentConfigs(namespace).Delete(context.TODO(), deploymentConfigName, metav1.DeleteOptions{})
 	time.Sleep(3 * time.Second)
 	return deploymentConfigError
 }
@@ -738,7 +1068,7 @@ func DeleteDeploymentConfig(client appsclient.Interface, namespace string, deplo
 // DeleteDaemonSet creates a daemonset in given namespace and returns the error if any
 func DeleteDaemonSet(client kubernetes.Interface, namespace string, daemonsetName string) error {
 	logrus.Infof("Deleting DaemonSet %s", daemonsetName)
-	daemonsetError := client.AppsV1().DaemonSets(namespace).Delete(daemonsetName, &metav1.DeleteOptions{})
+	daemonsetError := client.AppsV1().DaemonSets(namespace).Delete(context.TODO(), daemonsetName, metav1.DeleteOptions{})
 	time.Sleep(3 * time.Second)
 	return daemonsetError
 }
@@ -746,9 +1076,25 @@ func DeleteDaemonSet(client kubernetes.Interface, namespace string, daemonsetNam
 // DeleteStatefulSet creates a statefulset in given namespace and returns the error if any
 func DeleteStatefulSet(client kubernetes.Interface, namespace string, statefulsetName string) error {
 	logrus.Infof("Deleting StatefulSet %s", statefulsetName)
-	statefulsetError := client.AppsV1().StatefulSets(namespace).Delete(statefulsetName, &metav1.DeleteOptions{})
+	statefulsetError := client.AppsV1().StatefulSets(namespace).Delete(context.TODO(), statefulsetName, metav1.DeleteOptions{})
 	time.Sleep(3 * time.Second)
 	return statefulsetError
+}
+
+// DeleteCronJob deletes a cronJob in given namespace and returns the error if any
+func DeleteCronJob(client kubernetes.Interface, namespace string, cronJobName string) error {
+	logrus.Infof("Deleting CronJob %s", cronJobName)
+	cronJobError := client.BatchV1().CronJobs(namespace).Delete(context.TODO(), cronJobName, metav1.DeleteOptions{})
+	time.Sleep(3 * time.Second)
+	return cronJobError
+}
+
+// Deleteob deletes a job in given namespace and returns the error if any
+func DeleteJob(client kubernetes.Interface, namespace string, jobName string) error {
+	logrus.Infof("Deleting Job %s", jobName)
+	jobError := client.BatchV1().Jobs(namespace).Delete(context.TODO(), jobName, metav1.DeleteOptions{})
+	time.Sleep(3 * time.Second)
+	return jobError
 }
 
 // UpdateConfigMap updates a configmap in given namespace and returns the error if any
@@ -760,7 +1106,7 @@ func UpdateConfigMap(configmapClient core_v1.ConfigMapInterface, namespace strin
 	} else {
 		configmap = GetConfigmap(namespace, configmapName, data)
 	}
-	_, updateErr := configmapClient.Update(configmap)
+	_, updateErr := configmapClient.Update(context.TODO(), configmap, metav1.UpdateOptions{})
 	time.Sleep(3 * time.Second)
 	return updateErr
 }
@@ -774,7 +1120,28 @@ func UpdateSecret(secretClient core_v1.SecretInterface, namespace string, secret
 	} else {
 		secret = GetSecret(namespace, secretName, data)
 	}
-	_, updateErr := secretClient.Update(secret)
+	_, updateErr := secretClient.Update(context.TODO(), secret, metav1.UpdateOptions{})
+	time.Sleep(3 * time.Second)
+	return updateErr
+}
+
+// UpdateSecretProviderClassPodStatus updates a secretproviderclasspodstatus in given namespace and returns the error if any
+func UpdateSecretProviderClassPodStatus(spcpsClient csiclient_v1.SecretProviderClassPodStatusInterface, namespace string, spcpsName string, label string, data string) error {
+	logrus.Infof("Updating secretproviderclasspodstatus %q.\n", spcpsName)
+	updatedStatus := GetSecretProviderClassPodStatus(namespace, spcpsName, data).Status
+	secretproviderclasspodstatus, err := spcpsClient.Get(context.TODO(), spcpsName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	secretproviderclasspodstatus.Status = updatedStatus
+	if label != "" {
+		labels := secretproviderclasspodstatus.Labels
+		if labels == nil {
+			labels = make(map[string]string)
+		}
+		labels["firstLabel"] = label
+	}
+	_, updateErr := spcpsClient.Update(context.TODO(), secretproviderclasspodstatus, metav1.UpdateOptions{})
 	time.Sleep(3 * time.Second)
 	return updateErr
 }
@@ -782,7 +1149,7 @@ func UpdateSecret(secretClient core_v1.SecretInterface, namespace string, secret
 // DeleteConfigMap deletes a configmap in given namespace and returns the error if any
 func DeleteConfigMap(client kubernetes.Interface, namespace string, configmapName string) error {
 	logrus.Infof("Deleting configmap %q.\n", configmapName)
-	err := client.CoreV1().ConfigMaps(namespace).Delete(configmapName, &metav1.DeleteOptions{})
+	err := client.CoreV1().ConfigMaps(namespace).Delete(context.TODO(), configmapName, metav1.DeleteOptions{})
 	time.Sleep(3 * time.Second)
 	return err
 }
@@ -790,14 +1157,29 @@ func DeleteConfigMap(client kubernetes.Interface, namespace string, configmapNam
 // DeleteSecret deletes a secret in given namespace and returns the error if any
 func DeleteSecret(client kubernetes.Interface, namespace string, secretName string) error {
 	logrus.Infof("Deleting secret %q.\n", secretName)
-	err := client.CoreV1().Secrets(namespace).Delete(secretName, &metav1.DeleteOptions{})
+	err := client.CoreV1().Secrets(namespace).Delete(context.TODO(), secretName, metav1.DeleteOptions{})
+	time.Sleep(3 * time.Second)
+	return err
+}
+
+// DeleteSecretProviderClass deletes a secretproviderclass in given namespace and returns the error if any
+func DeleteSecretProviderClass(client csiclient.Interface, namespace string, secretProviderClassName string) error {
+	logrus.Infof("Deleting secretproviderclass %q.\n", secretProviderClassName)
+	err := client.SecretsstoreV1().SecretProviderClasses(namespace).Delete(context.TODO(), secretProviderClassName, metav1.DeleteOptions{})
+	time.Sleep(3 * time.Second)
+	return err
+}
+
+// DeleteSecretProviderClassPodStatus deletes a secretproviderclasspodstatus in given namespace and returns the error if any
+func DeleteSecretProviderClassPodStatus(client csiclient.Interface, namespace string, secretProviderClassPodStatusName string) error {
+	logrus.Infof("Deleting secretproviderclasspodstatus %q.\n", secretProviderClassPodStatusName)
+	err := client.SecretsstoreV1().SecretProviderClassPodStatuses(namespace).Delete(context.TODO(), secretProviderClassPodStatusName, metav1.DeleteOptions{})
 	time.Sleep(3 * time.Second)
 	return err
 }
 
 // RandSeq generates a random sequence
 func RandSeq(n int) string {
-	rand.Seed(time.Now().UnixNano())
 	b := make([]rune, n)
 	for i := range b {
 		b[i] = letters[rand.Intn(len(letters))]
@@ -805,18 +1187,25 @@ func RandSeq(n int) string {
 	return string(b)
 }
 
-// VerifyResourceUpdate verifies whether the rolling upgrade happened or not
-func VerifyResourceUpdate(clients kube.Clients, config util.Config, envVarPostfix string, upgradeFuncs callbacks.RollingUpgradeFuncs) bool {
+// VerifyResourceEnvVarUpdate verifies whether the rolling upgrade happened or not
+func VerifyResourceEnvVarUpdate(clients kube.Clients, config common.Config, envVarPostfix string, upgradeFuncs callbacks.RollingUpgradeFuncs) bool {
 	items := upgradeFuncs.ItemsFunc(clients, config.Namespace)
 	for _, i := range items {
 		containers := upgradeFuncs.ContainersFunc(i)
+		accessor, err := meta.Accessor(i)
+		if err != nil {
+			return false
+		}
+		annotations := accessor.GetAnnotations()
 		// match statefulsets with the correct annotation
-		annotationValue := util.ToObjectMeta(i).Annotations[config.Annotation]
-		searchAnnotationValue := util.ToObjectMeta(i).Annotations[options.AutoSearchAnnotation]
-		reloaderEnabledValue := util.ToObjectMeta(i).Annotations[options.ReloaderAutoAnnotation]
+		annotationValue := annotations[config.Annotation]
+		searchAnnotationValue := annotations[options.AutoSearchAnnotation]
+		reloaderEnabledValue := annotations[options.ReloaderAutoAnnotation]
+		typedAutoAnnotationEnabledValue := annotations[config.TypedAutoAnnotation]
 		reloaderEnabled, err := strconv.ParseBool(reloaderEnabledValue)
+		typedAutoAnnotationEnabled, errTyped := strconv.ParseBool(typedAutoAnnotationEnabledValue)
 		matches := false
-		if err == nil && reloaderEnabled {
+		if err == nil && reloaderEnabled || errTyped == nil && typedAutoAnnotationEnabled {
 			matches = true
 		} else if annotationValue != "" {
 			values := strings.Split(annotationValue, ",")
@@ -835,11 +1224,138 @@ func VerifyResourceUpdate(clients kube.Clients, config util.Config, envVarPostfi
 
 		if matches {
 			envName := constants.EnvVarPrefix + util.ConvertToEnvVarName(config.ResourceName) + "_" + envVarPostfix
-			updated := GetResourceSHA(containers, envName)
+			updated := GetResourceSHAFromEnvVar(containers, envName)
 			if updated == config.SHAValue {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// VerifyResourceEnvVarRemoved verifies whether the rolling upgrade happened or not and all Envvars SKAKATER_name_CONFIGMAP/SECRET are removed
+func VerifyResourceEnvVarRemoved(clients kube.Clients, config common.Config, envVarPostfix string, upgradeFuncs callbacks.RollingUpgradeFuncs) bool {
+	items := upgradeFuncs.ItemsFunc(clients, config.Namespace)
+	for _, i := range items {
+		containers := upgradeFuncs.ContainersFunc(i)
+		accessor, err := meta.Accessor(i)
+		if err != nil {
+			return false
+		}
+
+		annotations := accessor.GetAnnotations()
+		// match statefulsets with the correct annotation
+
+		annotationValue := annotations[config.Annotation]
+		searchAnnotationValue := annotations[options.AutoSearchAnnotation]
+		reloaderEnabledValue := annotations[options.ReloaderAutoAnnotation]
+		typedAutoAnnotationEnabledValue := annotations[config.TypedAutoAnnotation]
+		reloaderEnabled, err := strconv.ParseBool(reloaderEnabledValue)
+		typedAutoAnnotationEnabled, errTyped := strconv.ParseBool(typedAutoAnnotationEnabledValue)
+
+		matches := false
+		if err == nil && reloaderEnabled || errTyped == nil && typedAutoAnnotationEnabled {
+			matches = true
+		} else if annotationValue != "" {
+			values := strings.Split(annotationValue, ",")
+			for _, value := range values {
+				value = strings.Trim(value, " ")
+				if value == config.ResourceName {
+					matches = true
+					break
+				}
+			}
+		} else if searchAnnotationValue == "true" {
+			if config.ResourceAnnotations[options.SearchMatchAnnotation] == "true" {
+				matches = true
+			}
+		}
+
+		if matches {
+			envName := constants.EnvVarPrefix + util.ConvertToEnvVarName(config.ResourceName) + "_" + envVarPostfix
+			value := GetResourceSHAFromEnvVar(containers, envName)
+			if value == "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// VerifyResourceAnnotationUpdate verifies whether the rolling upgrade happened or not
+func VerifyResourceAnnotationUpdate(clients kube.Clients, config common.Config, upgradeFuncs callbacks.RollingUpgradeFuncs) bool {
+	items := upgradeFuncs.ItemsFunc(clients, config.Namespace)
+	for _, i := range items {
+		podAnnotations := upgradeFuncs.PodAnnotationsFunc(i)
+		accessor, err := meta.Accessor(i)
+		if err != nil {
+			return false
+		}
+		annotations := accessor.GetAnnotations()
+		// match statefulsets with the correct annotation
+		annotationValue := annotations[config.Annotation]
+		searchAnnotationValue := annotations[options.AutoSearchAnnotation]
+		reloaderEnabledValue := annotations[options.ReloaderAutoAnnotation]
+		typedAutoAnnotationEnabledValue := annotations[config.TypedAutoAnnotation]
+		reloaderEnabled, _ := strconv.ParseBool(reloaderEnabledValue)
+		typedAutoAnnotationEnabled, _ := strconv.ParseBool(typedAutoAnnotationEnabledValue)
+		matches := false
+		if reloaderEnabled || typedAutoAnnotationEnabled || reloaderEnabledValue == "" && typedAutoAnnotationEnabledValue == "" && options.AutoReloadAll {
+			matches = true
+		} else if annotationValue != "" {
+			values := strings.Split(annotationValue, ",")
+			for _, value := range values {
+				value = strings.Trim(value, " ")
+				if value == config.ResourceName {
+					matches = true
+					break
+				}
+			}
+		} else if searchAnnotationValue == "true" {
+			if config.ResourceAnnotations[options.SearchMatchAnnotation] == "true" {
+				matches = true
+			}
+		}
+
+		if matches {
+			updated := GetResourceSHAFromAnnotation(podAnnotations)
+			if updated == config.SHAValue {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func GetSHAfromEmptyData() string {
+	// Use a special marker that represents "deleted" or "empty" state
+	// This ensures we have a distinct, deterministic hash for the delete strategy
+	// Note: We could use GenerateSHA("") which now returns a hash, but using a marker
+	// makes the intent clearer and avoids potential confusion with actual empty data
+	return crypto.GenerateSHA("__RELOADER_EMPTY_DELETE_MARKER__")
+}
+
+// GetRollout provides rollout for testing
+func GetRollout(namespace string, rolloutName string, annotations map[string]string) *argorolloutv1alpha1.Rollout {
+	replicaset := int32(1)
+	return &argorolloutv1alpha1.Rollout{
+		ObjectMeta: getObjectMeta(namespace, rolloutName, false, false, false, false, annotations),
+		Spec: argorolloutv1alpha1.RolloutSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"secondLabel": "temp"},
+			},
+			Replicas: &replicaset,
+			Template: getPodTemplateSpecWithVolumes(rolloutName),
+		},
+	}
+}
+
+// CreateRollout creates a rolout in given namespace and returns the Rollout
+func CreateRollout(client argorollout.Interface, rolloutName string, namespace string, annotations map[string]string) (*argorolloutv1alpha1.Rollout, error) {
+	logrus.Infof("Creating Rollout")
+	rolloutClient := client.ArgoprojV1alpha1().Rollouts(namespace)
+	rolloutObj := GetRollout(namespace, rolloutName, annotations)
+	rollout, err := rolloutClient.Create(context.TODO(), rolloutObj, metav1.CreateOptions{})
+	time.Sleep(3 * time.Second)
+	return rollout, err
 }

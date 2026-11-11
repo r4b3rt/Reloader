@@ -9,18 +9,31 @@ kubernetes:
   host: https://kubernetes.default
 
 reloader:
+  isArgoRollouts: false
   isOpenshift: false
   ignoreSecrets: false
   ignoreConfigMaps: false
+  reloadOnCreate: false
+  reloadStrategy: default # Set to default, env-vars or annotations
   ignoreNamespaces: "" # Comma separated list of namespaces to ignore
   logFormat: "" #json
   watchGlobally: true
+  # Scoped mode: explicit list of namespaces to watch. When non-empty (and watchGlobally
+  # is false), Reloader watches exactly these namespaces and the chart creates a namespace
+  # scoped Role + RoleBinding in each one — no ClusterRole is created. The release namespace
+  # is always included automatically.
+  # Accepts either a YAML list (e.g. ["team-a", "team-b"]) or a comma-separated string
+  # (e.g. "team-a,team-b")
+  namespaces: []
   # Set to true if you have a pod security policy that enforces readOnlyRootFilesystem
   readOnlyRootFileSystem: false
   legacy:
     rbac: false
   matchLabels: {}
+  # Set to true to expose a prometheus counter of reloads by namespace (this metric may have high cardinality in clusters with many namespaces)
+  enableMetricsByNamespace: false
   deployment:
+    replicas: 1
     nodeSelector:
     # cloud.google.com/gke-nodepool: default-pool
 
@@ -38,6 +51,13 @@ reloader:
     securityContext:
       runAsNonRoot: true
       runAsUser: 65534
+
+    containerSecurityContext: {}
+      # capabilities:
+      #   drop:
+      #     - ALL
+      # allowPrivilegeEscalation: false
+      # readOnlyRootFilesystem: true
 
     # A list of tolerations to be applied to the Deployment.
     # Example:
@@ -91,6 +111,7 @@ reloader:
     # Specifies whether a ServiceAccount should be created
     create: true
     labels: {}
+    annotations: {}
     # The name of the ServiceAccount to use.
     # If not set and create is true, a name is generated using the fullname template
     name: 
@@ -112,3 +133,17 @@ reloader:
     # Set timeout for scrape
     # timeout: 10s
   
+
+  podMonitor:
+    # enabling this requires service to be enabled as well, or no endpoints will be found
+    enabled: false
+    # Set the namespace the podMonitor should be deployed
+    # namespace: monitoring
+    # Set how frequently Prometheus should scrape
+    # interval: 30s
+    # Set labels for the podMonitor, use this to define your scrape label for Prometheus Operator
+    # labels:
+    # Set timeout for scrape
+    # timeout: 10s
+  
+  webhookUrl: ""
